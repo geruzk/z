@@ -404,7 +404,13 @@ def build_output_rows(cands: List[Candidate], df_a: pd.DataFrame, df_b: pd.DataF
     for c in cands:
         a_row = df_a.iloc[c.a_idx]
         b_row = df_b.iloc[c.b_idx]
-        row: Dict[str, object] = {f"A_{col}": a_row[col] for col in a_row.index}
+        row: Dict[str, object] = {
+            "A_File": file_a,
+            "A_Idx": int(c.a_idx),
+            "B_File": file_b,
+            "B_Idx": int(c.b_idx),
+        }
+        row.update({f"A_{col}": a_row[col] for col in a_row.index})
         row.update({f"B_{col}": b_row[col] for col in b_row.index})
         row.update(
             {
@@ -425,16 +431,104 @@ def build_output_rows(cands: List[Candidate], df_a: pd.DataFrame, df_b: pd.DataF
     return rows
 
 
+def dedupe_match_rows(rows: List[Dict[str, object]], priority: int) -> Dict[Tuple[Tuple[str, int], Tuple[str, int]], Dict[str, object]]:
+    deduped: Dict[Tuple[Tuple[str, int], Tuple[str, int]], Dict[str, object]] = {}
+    for r in rows:
+        a = (str(r["A_File"]), int(r["A_Idx"]))
+        b = (str(r["B_File"]), int(r["B_Idx"]))
+        key = tuple(sorted([a, b]))
+        if key not in deduped:
+            rr = dict(r)
+            rr["_priority"] = priority
+            deduped[key] = rr
+            continue
+
+        old = deduped[key]
+        old_pr = int(old.get("_priority", 99))
+        if priority < old_pr:
+            rr = dict(r)
+            rr["_priority"] = priority
+            deduped[key] = rr
+        elif priority == old_pr and float(r.get("Weighted Score (%)", 0) or 0) > float(old.get("Weighted Score (%)", 0) or 0):
+            rr = dict(r)
+            rr["_priority"] = priority
+            deduped[key] = rr
+    return deduped
+
+
+def one_to_one_global(rows: List[Dict[str, object]]) -> List[Dict[str, object]]:
+    ranked = sorted(rows, key=lambda r: (float(r.get("Weighted Score (%)", 0) or 0), float(r.get("Name Score (%)", 0) or 0), -float(r.get("Distance (m)", 1e9) or 1e9)), reverse=True)
+    used: Set[Tuple[str, int]] = set()
+    out: List[Dict[str, object]] = []
+    for r in ranked:
+        a = (str(r["A_File"]), int(r["A_Idx"]))
+        b = (str(r["B_File"]), int(r["B_Idx"]))
+        if a in used or b in used:
+            continue
+        used.add(a)
+        used.add(b)
+        out.append(r)
+    return out
+
+
+def apply_excel_colors(path: str) -> None:
+    from openpyxl import load_workbook
+    from openpyxl.styles import PatternFill, Font
+
+    wb = load_workbook(path)
+
+    header_fill = PatternFill("solid", fgColor="1F4E78")
+    header_font = Font(color="FFFFFF", bold=True)
+    confirmed_fill = PatternFill("solid", fgColor="C6EFCE")
+    strong_fill = PatternFill("solid", fgColor="FCE4D6")
+    possible_fill = PatternFill("solid", fgColor="FFF2CC")
+    unique_fill = PatternFill("solid", fgColor="E7E6E6")
+
+    for ws in wb.worksheets:
+        if ws.max_row == 0:
+            continue
+        for cell in ws[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+
+        if ws.title == "Confirmed_Matches":
+            for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
+                for c in row:
+                    c.fill = confirmed_fill
+        elif ws.title == "Review_Matches":
+            # color by confidence value
+            col_index = None
+            for i, c in enumerate(ws[1], start=1):
+                if c.value == "Confidence":
+                    col_index = i
+                    break
+            if col_index:
+                for r in range(2, ws.max_row + 1):
+                    conf = str(ws.cell(r, col_index).value or "")
+                    fill = strong_fill if "Strong" in conf else possible_fill
+                    for c in ws[r]:
+                        c.fill = fill
+        elif ws.title == "Unique_Stores":
+            for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
+                for c in row:
+                    c.fill = unique_fill
+
+    wb.save(path)
+
+
 def main() -> None:
     files_data = read_input_files()
     if len(files_data) < 2:
         raise RuntimeError("Need at least 2 files.")
 
     file_names = sorted(files_data.keys())
-    all_confirmed: List[Dict[str, object]] = []
-    all_strong: List[Dict[str, object]] = []
-    all_possible: List[Dict[str, object]] = []
-    matched_store_ids: Set[Tuple[str, int]] = set()
+
+    # count true input stores once
+    total_input_stores = sum(len(df) for df in files_data.values())
+
+    raw_confirmed: List[Dict[str, object]] = []
+    raw_strong: List[Dict[str, object]] = []
+    raw_possible: List[Dict[str, object]] = []
 
     for i, file_a in enumerate(file_names):
         for j, file_b in enumerate(file_names):
@@ -444,24 +538,47 @@ def main() -> None:
             df_b = files_data[file_b].copy()
             confirmed, strong, possible, _, _ = run_phase(df_a, df_b, f"{file_a}→{file_b}")
 
-            all_confirmed.extend(build_output_rows(confirmed, df_a, df_b, file_a, file_b))
-            all_strong.extend(build_output_rows(strong, df_a, df_b, file_a, file_b))
-            all_possible.extend(build_output_rows(possible, df_a, df_b, file_a, file_b))
+            raw_confirmed.extend(build_output_rows(confirmed, df_a, df_b, file_a, file_b))
+            raw_strong.extend(build_output_rows(strong, df_a, df_b, file_a, file_b))
+            raw_possible.extend(build_output_rows(possible, df_a, df_b, file_a, file_b))
 
-            for c in confirmed + strong + possible:
-                matched_store_ids.add((file_a, c.a_idx))
-                matched_store_ids.add((file_b, c.b_idx))
+    # 1) normalize A<->B duplicates, 2) enforce tier priority, 3) global one-to-one
+    merged: Dict[Tuple[Tuple[str, int], Tuple[str, int]], Dict[str, object]] = {}
+    for key, row in dedupe_match_rows(raw_possible, priority=3).items():
+        merged[key] = row
+    for key, row in dedupe_match_rows(raw_strong, priority=2).items():
+        old = merged.get(key)
+        if old is None or row["_priority"] < old["_priority"] or (row["_priority"] == old["_priority"] and float(row.get("Weighted Score (%)", 0) or 0) > float(old.get("Weighted Score (%)", 0) or 0)):
+            merged[key] = row
+    for key, row in dedupe_match_rows(raw_confirmed, priority=1).items():
+        old = merged.get(key)
+        if old is None or row["_priority"] < old["_priority"] or (row["_priority"] == old["_priority"] and float(row.get("Weighted Score (%)", 0) or 0) > float(old.get("Weighted Score (%)", 0) or 0)):
+            merged[key] = row
+
+    final_matches = one_to_one_global(list(merged.values()))
+    for r in final_matches:
+        r.pop("_priority", None)
+
+    all_confirmed = [r for r in final_matches if str(r.get("Confidence", "")).startswith("✓")]
+    review_matches = [r for r in final_matches if not str(r.get("Confidence", "")).startswith("✓")]
+
+    matched_store_ids: Set[Tuple[str, int]] = set()
+    for r in final_matches:
+        matched_store_ids.add((str(r["A_File"]), int(r["A_Idx"])))
+        matched_store_ids.add((str(r["B_File"]), int(r["B_Idx"])))
 
     unique_rows: List[Dict[str, object]] = []
     for file_name in file_names:
         df = files_data[file_name]
         for idx, row in df.iterrows():
-            if (file_name, idx) in matched_store_ids:
+            if (file_name, int(idx)) in matched_store_ids:
                 continue
             rec = {col: row[col] for col in row.index}
             rec["Source_File"] = file_name
             rec["Status"] = f"✗ Unique to {file_name}"
             unique_rows.append(rec)
+
+    total_output_stores = len(matched_store_ids) + len(unique_rows)
 
     default_out = "/content/improved_bidirectional_matching.xlsx" if os.path.isdir("/content") else "improved_bidirectional_matching.xlsx"
     out_path = os.environ.get("MATCH_OUTPUT_PATH", default_out)
@@ -473,10 +590,13 @@ def main() -> None:
                 "Metric": [
                     "Generated",
                     "Files",
+                    "Total Input Stores",
                     "Confirmed Pairs",
-                    "Strong Possible Pairs",
-                    "Possible Pairs",
+                    "Review Pairs (Strong+Possible)",
                     "Unique Stores",
+                    "Matched Stores (counted once)",
+                    "Total Output Stores (matched+unique)",
+                    "Integrity Check",
                     "Name Weight",
                     "Location Weight",
                     "Address Weight",
@@ -486,10 +606,13 @@ def main() -> None:
                 "Value": [
                     datetime.now().isoformat(timespec="seconds"),
                     ", ".join(file_names),
+                    total_input_stores,
                     len(all_confirmed),
-                    len(all_strong),
-                    len(all_possible),
+                    len(review_matches),
                     len(unique_rows),
+                    len(matched_store_ids),
+                    total_output_stores,
+                    "PASS" if total_output_stores == total_input_stores else "FAIL",
                     NAME_WEIGHT,
                     LOCATION_WEIGHT,
                     ADDRESS_WEIGHT,
@@ -498,10 +621,12 @@ def main() -> None:
                 ],
             }
         ).to_excel(writer, index=False, sheet_name="Summary")
+
         pd.DataFrame(all_confirmed).to_excel(writer, index=False, sheet_name="Confirmed_Matches")
-        pd.DataFrame(all_strong).to_excel(writer, index=False, sheet_name="Strong_Possible_Matches")
-        pd.DataFrame(all_possible).to_excel(writer, index=False, sheet_name="Possible_Matches")
+        pd.DataFrame(review_matches).to_excel(writer, index=False, sheet_name="Review_Matches")
         pd.DataFrame(unique_rows).to_excel(writer, index=False, sheet_name="Unique_Stores")
+
+    apply_excel_colors(out_path)
 
     print(f"Saved: {out_path}")
 
