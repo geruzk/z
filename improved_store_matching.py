@@ -862,6 +862,8 @@ def main() -> None:
 
     # ---------- Stage 1: B<->C matching and export ----------
     bc_pair_rows: List[Dict[str, object]] = []
+    bc_stage_confirmed_count = 0
+    bc_stage_possible_count = 0
     if stage_mode in ("all", "stage1"):
         print("[Stage 1] Matching compare files (e.g., B↔C)...")
         bc_raw_confirmed: List[Dict[str, object]] = []
@@ -893,11 +895,35 @@ def main() -> None:
         for r in bc_pair_rows:
             r.pop("_priority", None)
 
-        print(f"[Stage 1] Final B/C pairs after dedupe: {len(bc_pair_rows)}")
+        bc_stage_confirmed_count = sum(1 for r in bc_pair_rows if str(r.get("Confidence", "")).startswith("✓"))
+        bc_stage_possible_count = len(bc_pair_rows) - bc_stage_confirmed_count
+
+        paired_bc_ids: Set[Tuple[str, int]] = set()
+        for r in bc_pair_rows:
+            paired_bc_ids.add((str(r["A_File"]), int(r["A_Idx"])))
+            paired_bc_ids.add((str(r["B_File"]), int(r["B_Idx"])))
+        all_compare_ids = {(f, int(i)) for f in compare_files for i in files_data[f].index}
+        bc_unique_ids = sorted(all_compare_ids - paired_bc_ids)
+        bc_unique_rows: List[Dict[str, object]] = []
+        for file_name, idx in bc_unique_ids:
+            row = files_data[file_name].iloc[idx]
+            rec = {col: row[col] for col in row.index}
+            rec.update({"Source_File": file_name, "Source_Idx": int(idx), "Status": "✗ Unique (No condition met)", "Reason_Code": "NO_RULE_MATCH"})
+            bc_unique_rows.append(rec)
+
+        print(f"[Stage 1] Final B/C pairs after dedupe: {len(bc_pair_rows)} (Confirmed={bc_stage_confirmed_count}, Possible={bc_stage_possible_count})")
+        print(f"[Stage 1] B/C unique stores: {len(bc_unique_rows)}")
         # Persist stage1 artifact for explicit 2-step pipeline
         with pd.ExcelWriter(bc_stage_path, engine="openpyxl") as writer:
             pd.DataFrame(bc_pair_rows).to_excel(writer, index=False, sheet_name="BC_Pairs")
             pd.DataFrame(_present_pair_rows(bc_pair_rows)).to_excel(writer, index=False, sheet_name="BC_Pairs_Presented")
+            pd.DataFrame(bc_unique_rows).to_excel(writer, index=False, sheet_name="BC_Unique_Stores")
+            pd.DataFrame(
+                {
+                    "Metric": ["Generated", "Run Mode", "Compared Files", "BC Stage Final Pairs", "BC Stage Confirmed Pairs", "BC Stage Possible Pairs", "BC Stage Unique Stores"],
+                    "Value": [datetime.now().isoformat(timespec="seconds"), stage_mode, ", ".join(compare_files), len(bc_pair_rows), bc_stage_confirmed_count, bc_stage_possible_count, len(bc_unique_rows)],
+                }
+            ).to_excel(writer, index=False, sheet_name="BC_Summary")
         print(f"[Stage 1] Exported BC stage artifact: {bc_stage_path}")
 
         if stage_mode == "stage1":
@@ -911,7 +937,9 @@ def main() -> None:
         for r in bc_pair_rows:
             r["A_Idx"] = int(float(r.get("A_Idx", -1)))
             r["B_Idx"] = int(float(r.get("B_Idx", -1)))
-        print(f"[Stage 2] Loaded BC pairs from artifact: {len(bc_pair_rows)}")
+        bc_stage_confirmed_count = sum(1 for r in bc_pair_rows if str(r.get("Confidence", "")).startswith("✓"))
+        bc_stage_possible_count = len(bc_pair_rows) - bc_stage_confirmed_count
+        print(f"[Stage 2] Loaded BC pairs from artifact: {len(bc_pair_rows)} (Confirmed={bc_stage_confirmed_count}, Possible={bc_stage_possible_count})")
 
     # ---------- Stage 2: map BC and remaining stores to A ----------
     bc_store_ids: Set[Tuple[str, int]] = set()
@@ -963,7 +991,7 @@ def main() -> None:
     confirmed_pair_rows: List[Dict[str, object]] = []
     possible_pair_rows: List[Dict[str, object]] = []
     matched_store_ids: Set[Tuple[str, int]] = set()
-    all_iteration_matched_ids: Set[Tuple[str, int]] = set(bc_store_ids)
+    all_iteration_matched_ids: Set[Tuple[str, int]] = set()
 
     for r in final_rows:
         a = (str(r["A_File"]), int(r["A_Idx"]))
@@ -1092,21 +1120,38 @@ def main() -> None:
     with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
         dashboard_df.to_excel(writer, index=False, sheet_name="Summary", startrow=0)
         meta_start = len(dashboard_rows) + 3
-        pd.DataFrame(
-            {
-                "Metric": ["Generated", "Run Mode", "BC Stage File", "Base File", "Compared Files", "Total Input Stores", "BC Stage Final Pairs", "BC→A Confirmed", "Confirmed Pair Rows", "Possible Pair Rows", "Unique Stores", "Matched Stores (counted once)", "Coverage Check (matched+unique==input)", "Matched Stores in Any Iteration", "Name Weight", "Location Weight", "Address Weight", "New Address Weight", "Confirmed Distance Gate", "Possible Extra Rule", "Per-File Split Sanity", "MAX_CANDIDATES", "Include Extra Tabs"],
-                "Value": [datetime.now().isoformat(timespec="seconds"), stage_mode, bc_stage_path, base_file, ", ".join(compare_files), total_input_stores, len(bc_pair_rows), len(bc_to_a_rows), len(confirmed_pair_rows), len(possible_pair_rows), len(unique_rows), matched_store_count, coverage_status, len(all_iteration_matched_ids), NAME_WEIGHT, LOCATION_WEIGHT, ADDRESS_WEIGHT, NEW_ADDRESS_WEIGHT, f"<= {CONFIRMED_DISTANCE_M}m", "Distance<=30m and New Address similarity>=60 even without name match", "PASS" if all((confirmed_by_file[f] + possible_by_file[f] + unique_by_file[f]) == total_by_file[f] for f in report_files) else "FAIL", MAX_CANDIDATES, "Yes" if include_extra_tabs else "No"],
-            }
-        ).to_excel(writer, index=False, sheet_name="Summary", startrow=meta_start)
+        summary_metrics = [
+            "Generated", "Run Mode", "BC Stage File", "Base File", "Compared Files", "Total Input Stores",
+            "BC Stage Final Pairs", "BC Stage Confirmed Pairs", "BC Stage Possible Pairs",
+            "BC→A Candidate Rows", "BC→A Final Rows", "BC→A Final Confirmed", "BC→A Final Possible",
+            "Confirmed Pair Rows", "Possible Pair Rows", "Unique Stores", "Matched Stores (counted once)",
+            "Coverage Check (matched+unique==input)", "Matched Stores in Any Iteration", "Name Weight", "Location Weight",
+            "Address Weight", "New Address Weight", "Confirmed Distance Gate", "Possible Extra Rule",
+            "Per-File Split Sanity", "MAX_CANDIDATES", "Include Extra Tabs",
+        ]
+        summary_values = [
+            datetime.now().isoformat(timespec="seconds"), stage_mode, bc_stage_path, base_file, ", ".join(compare_files),
+            total_input_stores, len(bc_pair_rows), bc_stage_confirmed_count, bc_stage_possible_count, len(bc_to_a_rows),
+            sum(1 for r in final_rows if str(r.get("Reason_Code", "")) == "BC_TO_A_MATCH"),
+            sum(1 for r in final_rows if str(r.get("Reason_Code", "")) == "BC_TO_A_MATCH" and str(r.get("Confidence", "")).startswith("✓")),
+            sum(1 for r in final_rows if str(r.get("Reason_Code", "")) == "BC_TO_A_MATCH" and not str(r.get("Confidence", "")).startswith("✓")),
+            len(confirmed_pair_rows), len(possible_pair_rows), len(unique_rows), matched_store_count, coverage_status,
+            len(all_iteration_matched_ids), NAME_WEIGHT, LOCATION_WEIGHT, ADDRESS_WEIGHT, NEW_ADDRESS_WEIGHT,
+            f"<= {CONFIRMED_DISTANCE_M}m", "Distance<=30m and New Address similarity>=60 even without name match",
+            "PASS" if all((confirmed_by_file[f] + possible_by_file[f] + unique_by_file[f]) == total_by_file[f] for f in report_files) else "FAIL",
+            MAX_CANDIDATES, "Yes" if include_extra_tabs else "No",
+        ]
+        pd.DataFrame({"Metric": summary_metrics, "Value": summary_values}).to_excel(writer, index=False, sheet_name="Summary", startrow=meta_start)
 
-        reason_df.to_excel(writer, index=False, sheet_name="Summary", startrow=meta_start + 26)
+        reason_start = meta_start + len(summary_metrics) + 3
+        reason_df.to_excel(writer, index=False, sheet_name="Summary", startrow=reason_start)
 
         pd.DataFrame(add_mapping_codes(confirmed_pair_rows)).to_excel(writer, index=False, sheet_name="Confirmed_Matches")
         pd.DataFrame(add_mapping_codes(possible_pair_rows)).to_excel(writer, index=False, sheet_name="Possible_Matches")
         pd.DataFrame(unique_rows).to_excel(writer, index=False, sheet_name="Unique_Stores")
 
         if include_extra_tabs:
-            pd.DataFrame(_present_pair_rows(bc_pair_rows)).to_excel(writer, index=False, sheet_name="BC_Stage_Matches")
+            pd.DataFrame(add_mapping_codes(bc_pair_rows)).to_excel(writer, index=False, sheet_name="BC_Stage_Matches")
             pd.DataFrame(add_mapping_codes(bc_to_a_rows)).to_excel(writer, index=False, sheet_name="BC_To_A_Matches")
 
     apply_excel_colors(out_path)
