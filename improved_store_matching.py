@@ -715,6 +715,46 @@ def _build_store_level_rows_from_pair_rows(pair_rows: List[Dict[str, object]], f
     return out
 
 
+
+
+def _present_pair_rows(pair_rows: List[Dict[str, object]]) -> List[Dict[str, object]]:
+    """Make pair output headers explicit and consistent (Store_1 / Store_2)."""
+    out: List[Dict[str, object]] = []
+
+    for r in pair_rows:
+        a_file = str(r.get("A_File", ""))
+        a_idx = int(r.get("A_Idx", -1))
+        b_file = str(r.get("B_File", ""))
+        b_idx = int(r.get("B_Idx", -1))
+
+        swap = (a_file, a_idx) > (b_file, b_idx)
+
+        rec: Dict[str, object] = {}
+
+        # Keep non A_/B_ fields first
+        for k, v in r.items():
+            if not k.startswith("A_") and not k.startswith("B_"):
+                rec[k] = v
+
+        # Then map store sides with clear naming
+        for k, v in r.items():
+            if k.startswith("A_"):
+                suffix = k[len("A_") :]
+                target = "Store_2_" + suffix if swap else "Store_1_" + suffix
+                rec[target] = v
+            elif k.startswith("B_"):
+                suffix = k[len("B_") :]
+                target = "Store_1_" + suffix if swap else "Store_2_" + suffix
+                rec[target] = v
+
+        rec["Pair_Store_1_ID"] = f"{rec.get('Store_1_File','')}:{rec.get('Store_1_Idx','')}"
+        rec["Pair_Store_2_ID"] = f"{rec.get('Store_2_File','')}:{rec.get('Store_2_Idx','')}"
+        rec["Pair_Label"] = f"{rec.get('Store_1_File','')} ↔ {rec.get('Store_2_File','')}"
+
+        out.append(rec)
+
+    return out
+
 def main() -> None:
     files_data = read_input_files()
     if len(files_data) < 2:
@@ -874,8 +914,11 @@ def main() -> None:
             }
         ).to_excel(writer, index=False, sheet_name="Summary")
 
-        pd.DataFrame(confirmed_pair_rows).to_excel(writer, index=False, sheet_name="Confirmed_Matches")
-        pd.DataFrame(possible_pair_rows).to_excel(writer, index=False, sheet_name="Possible_Matches")
+        confirmed_output_rows = _present_pair_rows(confirmed_pair_rows)
+        possible_output_rows = _present_pair_rows(possible_pair_rows)
+
+        pd.DataFrame(confirmed_output_rows).to_excel(writer, index=False, sheet_name="Confirmed_Matches")
+        pd.DataFrame(possible_output_rows).to_excel(writer, index=False, sheet_name="Possible_Matches")
         pd.DataFrame(unique_rows).to_excel(writer, index=False, sheet_name="Unique_Stores")
 
     apply_excel_colors(out_path)
