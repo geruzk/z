@@ -744,6 +744,7 @@ def main() -> None:
             raw_strong.extend(build_output_rows(strong, df_a, df_b, file_a, file_b))
             raw_possible.extend(build_output_rows(possible, df_a, df_b, file_a, file_b))
 
+    # Normalize A<->B duplicates, then priority Confirmed > Strong > Possible, then one-to-one
     merged: Dict[Tuple[Tuple[str, int], Tuple[str, int]], Dict[str, object]] = {}
     for key, row in dedupe_match_rows(raw_possible, priority=3).items():
         merged[key] = row
@@ -760,13 +761,17 @@ def main() -> None:
     for r in confirmed_pair_rows:
         r.pop("_priority", None)
 
-    confirmed_store_rows = _build_store_level_rows_from_pair_rows(confirmed_pair_rows, files_data, "✓ Confirmed (Similarity/Fuzzy)")
-    confirmed_store_ids = {(str(r["Source_File"]), int(r["Source_Idx"])) for r in confirmed_store_rows}
+    confirmed_store_ids: Set[Tuple[str, int]] = set()
+    for r in confirmed_pair_rows:
+        confirmed_store_ids.add((str(r["A_File"]), int(r["A_Idx"])))
+        confirmed_store_ids.add((str(r["B_File"]), int(r["B_Idx"])))
 
+    # Possible fallback (unmatched only): distance <=30m + new address similarity
     unmatched_after_confirmed = all_store_ids - confirmed_store_ids
     possible_pairs = build_possible_pairs_from_unmatched(files_data, unmatched_after_confirmed, new_addr_threshold=60.0)
 
     possible_pair_rows: List[Dict[str, object]] = []
+    possible_store_ids: Set[Tuple[str, int]] = set()
     for a_id, b_id, naddr_score, dist_m in possible_pairs:
         file_a, idx_a = a_id
         file_b, idx_b = b_id
@@ -806,9 +811,8 @@ def main() -> None:
             }
         )
         possible_pair_rows.append(rec)
-
-    possible_store_rows = _build_store_level_rows_from_pair_rows(possible_pair_rows, files_data, "⚠ Possible (Distance+NewAddress)")
-    possible_store_ids = {(str(r["Source_File"]), int(r["Source_Idx"])) for r in possible_store_rows}
+        possible_store_ids.add(a_id)
+        possible_store_ids.add(b_id)
 
     unique_store_ids = all_store_ids - confirmed_store_ids - possible_store_ids
     unique_rows: List[Dict[str, object]] = []
@@ -819,28 +823,14 @@ def main() -> None:
             {
                 "Source_File": file_name,
                 "Source_Idx": int(idx),
-                "Matched_With_File": "",
-                "Matched_With_Idx": "",
-                "Matched_With_Store_Name": "",
-                "Matched_With_Customer_Code": "",
-                "Comparison": "",
                 "Status": "✗ Unique (No condition met)",
-                "Name Score (%)": None,
-                "Address Score (%)": None,
-                "New Address Score (%)": None,
-                "Location Score (%)": None,
-                "Distance (m)": None,
-                "Weighted Score (%)": None,
-                "Shared_Generic_Tokens": "",
-                "Shared_Distinctive_Tokens": "",
                 "Reason_Code": "NO_RULE_MATCH",
-                "Confidence": "",
             }
         )
         unique_rows.append(rec)
 
-    total_split_rows = len(confirmed_store_rows) + len(possible_store_rows) + len(unique_rows)
-    integrity_status = "PASS" if total_split_rows == total_input_stores else "FAIL"
+    matched_store_count = len(confirmed_store_ids | possible_store_ids)
+    coverage_status = "PASS" if (matched_store_count + len(unique_rows) == total_input_stores) else "FAIL"
 
     default_out = "/content/improved_bidirectional_matching.xlsx" if os.path.isdir("/content") else "improved_bidirectional_matching.xlsx"
     out_path = os.environ.get("MATCH_OUTPUT_PATH", default_out)
@@ -853,13 +843,11 @@ def main() -> None:
                     "Generated",
                     "Files",
                     "Total Input Stores",
-                    "Confirmed Stores (tab rows)",
-                    "Possible Stores (tab rows)",
-                    "Unique Stores (tab rows)",
-                    "Total Split Rows (3 tabs)",
-                    "Integrity Check (sum tabs == input)",
-                    "Confirmed Pairs (for reference)",
-                    "Possible Pairs (for reference)",
+                    "Confirmed Pair Rows",
+                    "Possible Pair Rows",
+                    "Unique Stores",
+                    "Matched Stores (counted once)",
+                    "Coverage Check (matched+unique==input)",
                     "Name Weight",
                     "Location Weight",
                     "Address Weight",
@@ -871,13 +859,11 @@ def main() -> None:
                     datetime.now().isoformat(timespec="seconds"),
                     ", ".join(file_names),
                     total_input_stores,
-                    len(confirmed_store_rows),
-                    len(possible_store_rows),
-                    len(unique_rows),
-                    total_split_rows,
-                    integrity_status,
                     len(confirmed_pair_rows),
                     len(possible_pair_rows),
+                    len(unique_rows),
+                    matched_store_count,
+                    coverage_status,
                     NAME_WEIGHT,
                     LOCATION_WEIGHT,
                     ADDRESS_WEIGHT,
@@ -888,14 +874,16 @@ def main() -> None:
             }
         ).to_excel(writer, index=False, sheet_name="Summary")
 
-        pd.DataFrame(confirmed_store_rows).to_excel(writer, index=False, sheet_name="Confirmed_Matches")
-        pd.DataFrame(possible_store_rows).to_excel(writer, index=False, sheet_name="Possible_Matches")
+        pd.DataFrame(confirmed_pair_rows).to_excel(writer, index=False, sheet_name="Confirmed_Matches")
+        pd.DataFrame(possible_pair_rows).to_excel(writer, index=False, sheet_name="Possible_Matches")
         pd.DataFrame(unique_rows).to_excel(writer, index=False, sheet_name="Unique_Stores")
 
     apply_excel_colors(out_path)
 
     print(f"Saved: {out_path}")
-    print(f"Integrity: {integrity_status} | Input={total_input_stores}, SplitRows={total_split_rows}")
+    print(
+        f"Coverage: {coverage_status} | Input={total_input_stores}, MatchedStores={matched_store_count}, Unique={len(unique_rows)}"
+    )
 
     try:
         from google.colab import files as colab_files
