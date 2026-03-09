@@ -643,6 +643,78 @@ def build_possible_pairs_from_unmatched(files_data: Dict[str, pd.DataFrame], unm
     return final_pairs
 
 
+def _build_store_level_rows_from_pair_rows(pair_rows: List[Dict[str, object]], files_data: Dict[str, pd.DataFrame], tab_status: str) -> List[Dict[str, object]]:
+    """Convert pair rows into store-level rows (each store appears once max in a tab)."""
+    out: List[Dict[str, object]] = []
+    seen: Set[Tuple[str, int]] = set()
+
+    for pr in pair_rows:
+        a_file, a_idx = str(pr["A_File"]), int(pr["A_Idx"])
+        b_file, b_idx = str(pr["B_File"]), int(pr["B_Idx"])
+
+        # Row for A store
+        a_id = (a_file, a_idx)
+        if a_id not in seen:
+            src = files_data[a_file].iloc[a_idx]
+            rec_a: Dict[str, object] = {col: src[col] for col in src.index}
+            rec_a.update(
+                {
+                    "Source_File": a_file,
+                    "Source_Idx": a_idx,
+                    "Matched_With_File": b_file,
+                    "Matched_With_Idx": b_idx,
+                    "Matched_With_Store_Name": pr.get("B_store_name", ""),
+                    "Matched_With_Customer_Code": pr.get("B_Customer Code", ""),
+                    "Comparison": pr.get("Comparison", ""),
+                    "Status": tab_status,
+                    "Name Score (%)": pr.get("Name Score (%)"),
+                    "Address Score (%)": pr.get("Address Score (%)"),
+                    "New Address Score (%)": pr.get("New Address Score (%)"),
+                    "Location Score (%)": pr.get("Location Score (%)"),
+                    "Distance (m)": pr.get("Distance (m)"),
+                    "Weighted Score (%)": pr.get("Weighted Score (%)"),
+                    "Shared_Generic_Tokens": pr.get("Shared_Generic_Tokens", ""),
+                    "Shared_Distinctive_Tokens": pr.get("Shared_Distinctive_Tokens", ""),
+                    "Reason_Code": pr.get("Reason_Code", ""),
+                    "Confidence": pr.get("Confidence", ""),
+                }
+            )
+            out.append(rec_a)
+            seen.add(a_id)
+
+        # Row for B store
+        b_id = (b_file, b_idx)
+        if b_id not in seen:
+            src = files_data[b_file].iloc[b_idx]
+            rec_b: Dict[str, object] = {col: src[col] for col in src.index}
+            rec_b.update(
+                {
+                    "Source_File": b_file,
+                    "Source_Idx": b_idx,
+                    "Matched_With_File": a_file,
+                    "Matched_With_Idx": a_idx,
+                    "Matched_With_Store_Name": pr.get("A_store_name", ""),
+                    "Matched_With_Customer_Code": pr.get("A_Customer Code", ""),
+                    "Comparison": pr.get("Comparison", ""),
+                    "Status": tab_status,
+                    "Name Score (%)": pr.get("Name Score (%)"),
+                    "Address Score (%)": pr.get("Address Score (%)"),
+                    "New Address Score (%)": pr.get("New Address Score (%)"),
+                    "Location Score (%)": pr.get("Location Score (%)"),
+                    "Distance (m)": pr.get("Distance (m)"),
+                    "Weighted Score (%)": pr.get("Weighted Score (%)"),
+                    "Shared_Generic_Tokens": pr.get("Shared_Generic_Tokens", ""),
+                    "Shared_Distinctive_Tokens": pr.get("Shared_Distinctive_Tokens", ""),
+                    "Reason_Code": pr.get("Reason_Code", ""),
+                    "Confidence": pr.get("Confidence", ""),
+                }
+            )
+            out.append(rec_b)
+            seen.add(b_id)
+
+    return out
+
+
 def main() -> None:
     files_data = read_input_files()
     if len(files_data) < 2:
@@ -650,7 +722,6 @@ def main() -> None:
 
     file_names = sorted(files_data.keys())
 
-    # Input store universe (for coverage/integrity checks)
     all_store_ids: Set[Tuple[str, int]] = set()
     for fn in file_names:
         for idx in files_data[fn].index:
@@ -673,7 +744,6 @@ def main() -> None:
             raw_strong.extend(build_output_rows(strong, df_a, df_b, file_a, file_b))
             raw_possible.extend(build_output_rows(possible, df_a, df_b, file_a, file_b))
 
-    # Normalize A<->B duplicates and apply tier priority, then one-to-one pairing
     merged: Dict[Tuple[Tuple[str, int], Tuple[str, int]], Dict[str, object]] = {}
     for key, row in dedupe_match_rows(raw_possible, priority=3).items():
         merged[key] = row
@@ -686,21 +756,17 @@ def main() -> None:
         if old is None or row["_priority"] < old["_priority"] or (row["_priority"] == old["_priority"] and float(row.get("Weighted Score (%)", 0) or 0) > float(old.get("Weighted Score (%)", 0) or 0)):
             merged[key] = row
 
-    confirmed_rows = one_to_one_global(list(merged.values()))
-    for r in confirmed_rows:
+    confirmed_pair_rows = one_to_one_global(list(merged.values()))
+    for r in confirmed_pair_rows:
         r.pop("_priority", None)
 
-    confirmed_store_ids: Set[Tuple[str, int]] = set()
-    for r in confirmed_rows:
-        confirmed_store_ids.add((str(r["A_File"]), int(r["A_Idx"])))
-        confirmed_store_ids.add((str(r["B_File"]), int(r["B_Idx"])))
+    confirmed_store_rows = _build_store_level_rows_from_pair_rows(confirmed_pair_rows, files_data, "✓ Confirmed (Similarity/Fuzzy)")
+    confirmed_store_ids = {(str(r["Source_File"]), int(r["Source_Idx"])) for r in confirmed_store_rows}
 
-    # Possible fallback (even when name does not match): distance <=30m + new address similarity
     unmatched_after_confirmed = all_store_ids - confirmed_store_ids
     possible_pairs = build_possible_pairs_from_unmatched(files_data, unmatched_after_confirmed, new_addr_threshold=60.0)
 
-    possible_rows: List[Dict[str, object]] = []
-    possible_store_ids: Set[Tuple[str, int]] = set()
+    possible_pair_rows: List[Dict[str, object]] = []
     for a_id, b_id, naddr_score, dist_m in possible_pairs:
         file_a, idx_a = a_id
         file_b, idx_b = b_id
@@ -728,34 +794,53 @@ def main() -> None:
                 "Comparison": f"{file_a} ↔ {file_b}",
                 "Name Score (%)": round(name_score, 2),
                 "Address Score (%)": addr_score,
-                "New Address Score (%)": round(naddr_score, 2) if new_addr_score is not None else None,
+                "New Address Score (%)": round(new_addr_score, 2) if new_addr_score is not None else None,
                 "Location Score (%)": round(loc_score, 2),
                 "Distance (m)": round(dist_m, 2),
                 "Weighted Score (%)": round(w_score, 2),
                 "Shared_Generic_Tokens": shared_generic,
                 "Shared_Distinctive_Tokens": shared_distinctive,
                 "Reason_Code": "POSSIBLE_DIST<=30_AND_NEWADDR",
-                "Confidence": "⚠ Possible",
+                "Confidence": "⚠ Possible (Distance+NewAddress)",
                 "Generic_Only_Overlap": "Yes" if generic_only else "No",
             }
         )
-        possible_rows.append(rec)
-        possible_store_ids.add(a_id)
-        possible_store_ids.add(b_id)
+        possible_pair_rows.append(rec)
 
-    # Unique stores (once only)
+    possible_store_rows = _build_store_level_rows_from_pair_rows(possible_pair_rows, files_data, "⚠ Possible (Distance+NewAddress)")
+    possible_store_ids = {(str(r["Source_File"]), int(r["Source_Idx"])) for r in possible_store_rows}
+
     unique_store_ids = all_store_ids - confirmed_store_ids - possible_store_ids
     unique_rows: List[Dict[str, object]] = []
     for file_name, idx in sorted(unique_store_ids):
         row = files_data[file_name].iloc[idx]
         rec = {col: row[col] for col in row.index}
-        rec["Source_File"] = file_name
-        rec["Source_Idx"] = int(idx)
-        rec["Status"] = "✗ Unique"
+        rec.update(
+            {
+                "Source_File": file_name,
+                "Source_Idx": int(idx),
+                "Matched_With_File": "",
+                "Matched_With_Idx": "",
+                "Matched_With_Store_Name": "",
+                "Matched_With_Customer_Code": "",
+                "Comparison": "",
+                "Status": "✗ Unique (No condition met)",
+                "Name Score (%)": None,
+                "Address Score (%)": None,
+                "New Address Score (%)": None,
+                "Location Score (%)": None,
+                "Distance (m)": None,
+                "Weighted Score (%)": None,
+                "Shared_Generic_Tokens": "",
+                "Shared_Distinctive_Tokens": "",
+                "Reason_Code": "NO_RULE_MATCH",
+                "Confidence": "",
+            }
+        )
         unique_rows.append(rec)
 
-    matched_store_count = len(confirmed_store_ids | possible_store_ids)
-    coverage_status = "PASS" if (matched_store_count + len(unique_rows) == total_input_stores) else "FAIL"
+    total_split_rows = len(confirmed_store_rows) + len(possible_store_rows) + len(unique_rows)
+    integrity_status = "PASS" if total_split_rows == total_input_stores else "FAIL"
 
     default_out = "/content/improved_bidirectional_matching.xlsx" if os.path.isdir("/content") else "improved_bidirectional_matching.xlsx"
     out_path = os.environ.get("MATCH_OUTPUT_PATH", default_out)
@@ -768,11 +853,13 @@ def main() -> None:
                     "Generated",
                     "Files",
                     "Total Input Stores",
-                    "Confirmed Pairs",
-                    "Possible Pairs",
-                    "Unique Stores",
-                    "Matched Stores (counted once)",
-                    "Coverage Check (matched+unique==input)",
+                    "Confirmed Stores (tab rows)",
+                    "Possible Stores (tab rows)",
+                    "Unique Stores (tab rows)",
+                    "Total Split Rows (3 tabs)",
+                    "Integrity Check (sum tabs == input)",
+                    "Confirmed Pairs (for reference)",
+                    "Possible Pairs (for reference)",
                     "Name Weight",
                     "Location Weight",
                     "Address Weight",
@@ -784,11 +871,13 @@ def main() -> None:
                     datetime.now().isoformat(timespec="seconds"),
                     ", ".join(file_names),
                     total_input_stores,
-                    len(confirmed_rows),
-                    len(possible_rows),
+                    len(confirmed_store_rows),
+                    len(possible_store_rows),
                     len(unique_rows),
-                    matched_store_count,
-                    coverage_status,
+                    total_split_rows,
+                    integrity_status,
+                    len(confirmed_pair_rows),
+                    len(possible_pair_rows),
                     NAME_WEIGHT,
                     LOCATION_WEIGHT,
                     ADDRESS_WEIGHT,
@@ -799,18 +888,15 @@ def main() -> None:
             }
         ).to_excel(writer, index=False, sheet_name="Summary")
 
-        pd.DataFrame(confirmed_rows).to_excel(writer, index=False, sheet_name="Confirmed_Matches")
-        pd.DataFrame(possible_rows).to_excel(writer, index=False, sheet_name="Possible_Matches")
+        pd.DataFrame(confirmed_store_rows).to_excel(writer, index=False, sheet_name="Confirmed_Matches")
+        pd.DataFrame(possible_store_rows).to_excel(writer, index=False, sheet_name="Possible_Matches")
         pd.DataFrame(unique_rows).to_excel(writer, index=False, sheet_name="Unique_Stores")
 
     apply_excel_colors(out_path)
 
     print(f"Saved: {out_path}")
-    print(
-        f"Coverage: {coverage_status} | Input={total_input_stores}, MatchedStores={matched_store_count}, Unique={len(unique_rows)}"
-    )
+    print(f"Integrity: {integrity_status} | Input={total_input_stores}, SplitRows={total_split_rows}")
 
-    # Auto-download when running in Colab so users can access the file immediately.
     try:
         from google.colab import files as colab_files
 
