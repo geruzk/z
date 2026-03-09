@@ -556,9 +556,9 @@ def apply_excel_colors(path: str) -> None:
             cell.font = header_font
 
         fill = None
-        if ws.title == "Confirmed_Matches":
+        if ws.title in ("Confirmed_Matches", "BC_To_A_Matches"):
             fill = confirmed_fill
-        elif ws.title == "Possible_Matches":
+        elif ws.title in ("Possible_Matches", "BC_NotInA_Matches", "BC_Stage_Matches"):
             fill = possible_fill
         elif ws.title == "Unique_Stores":
             fill = unique_fill
@@ -861,15 +861,23 @@ def main() -> None:
     bc_raw_confirmed: List[Dict[str, object]] = []
     bc_raw_strong: List[Dict[str, object]] = []
     bc_raw_possible: List[Dict[str, object]] = []
+    bc_stage_rows: List[Dict[str, object]] = []
+    bc_to_a_rows: List[Dict[str, object]] = []
+    bc_not_in_a_rows: List[Dict[str, object]] = []
 
+    print("[Stage 1] Matching compare files (e.g., B↔C)...")
     for i in range(len(compare_files)):
         for j in range(i + 1, len(compare_files)):
             f1, f2 = compare_files[i], compare_files[j]
             df1, df2 = files_data[f1].copy(), files_data[f2].copy()
             c, s2, p2, _, _ = run_phase(df1, df2, f"{f1}→{f2}")
-            bc_raw_confirmed.extend(build_output_rows(c, df1, df2, f1, f2))
-            bc_raw_strong.extend(build_output_rows(s2, df1, df2, f1, f2))
-            bc_raw_possible.extend(build_output_rows(p2, df1, df2, f1, f2))
+            c_rows = build_output_rows(c, df1, df2, f1, f2)
+            s_rows = build_output_rows(s2, df1, df2, f1, f2)
+            p_rows = build_output_rows(p2, df1, df2, f1, f2)
+            bc_raw_confirmed.extend(c_rows)
+            bc_raw_strong.extend(s_rows)
+            bc_raw_possible.extend(p_rows)
+            bc_stage_rows.extend(c_rows + s_rows + p_rows)
 
     merged_bc: Dict[Tuple[Tuple[str, int], Tuple[str, int]], Dict[str, object]] = {}
     for key, row in dedupe_match_rows(bc_raw_possible, priority=3).items():
@@ -884,6 +892,7 @@ def main() -> None:
             merged_bc[key] = row
 
     bc_pair_rows = one_to_one_global(list(merged_bc.values()))
+    print(f"[Stage 1] Raw B/C candidates: {len(bc_stage_rows)} | Final B/C pairs after dedupe: {len(bc_pair_rows)}")
     for r in bc_pair_rows:
         r.pop("_priority", None)
 
@@ -897,6 +906,7 @@ def main() -> None:
         bc_peer_map[b] = (a[0], a[1], r.get("A_Customer Code", ""))
 
     # Step 2: Match B/C results to base A
+    print("[Stage 2] Rechecking B/C results against base A...")
     a_link_candidates: List[Dict[str, object]] = []
     for sid in sorted(bc_store_ids):
         sf, sidx = sid
@@ -919,6 +929,8 @@ def main() -> None:
             rec["Reason_Code"] = "BC_TO_A_MATCH"
         a_link_candidates.append(rec)
 
+    print(f"[Stage 2] BC→A matches: {len(bc_to_a_rows)} | BC duplicates not in A: {len(bc_not_in_a_rows)}")
+
     # Also match remaining compare-file stores directly to A
     remaining_compare_ids = {(f, int(i)) for f in compare_files for i in files_data[f].index} - bc_store_ids
     for sid in sorted(remaining_compare_ids):
@@ -930,6 +942,7 @@ def main() -> None:
 
     # Final dedupe one-to-one across A and compare stores
     final_rows = one_to_one_global(a_link_candidates)
+    print(f"[Stage 2] A-link candidates: {len(a_link_candidates)} | Final one-to-one A links: {len(final_rows)}")
 
     confirmed_pair_rows: List[Dict[str, object]] = []
     possible_pair_rows: List[Dict[str, object]] = []
@@ -992,6 +1005,8 @@ def main() -> None:
         matched_store_ids.update([(a_file, int(a_idx)), (b_file, int(b_idx))])
         all_iteration_matched_ids.update([(a_file, int(a_idx)), (b_file, int(b_idx))])
 
+    print(f"[Stage 3] Possible fallback pairs added: {len(possible_pair_rows)}")
+
     unique_store_ids = all_store_ids - all_iteration_matched_ids
     unique_rows: List[Dict[str, object]] = []
     for file_name, idx in sorted(unique_store_ids):
@@ -1033,6 +1048,13 @@ def main() -> None:
     dashboard_data["Total"] = [c_tot, p_tot, u_tot, t_tot, pct(c_tot, t_tot), pct(c_tot + p_tot, t_tot)]
 
     dashboard_df = pd.DataFrame(dashboard_data, index=dashboard_rows).reset_index().rename(columns={"index": "Metric"})
+
+    reason_rows = confirmed_pair_rows + possible_pair_rows
+    reason_counts: Dict[str, int] = {}
+    for rr in reason_rows:
+        rc = str(rr.get("Reason_Code", "UNKNOWN"))
+        reason_counts[rc] = reason_counts.get(rc, 0) + 1
+    reason_df = pd.DataFrame(sorted(reason_counts.items(), key=lambda x: x[0]), columns=["Reason_Code", "Count"])
 
     def add_mapping_codes(rows: List[Dict[str, object]]) -> List[Dict[str, object]]:
         out = []
@@ -1076,16 +1098,23 @@ def main() -> None:
 
     with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
         dashboard_df.to_excel(writer, index=False, sheet_name="Summary", startrow=0)
+        meta_start = len(dashboard_rows) + 3
         pd.DataFrame(
             {
-                "Metric": ["Generated", "Base File", "Compared Files", "Total Input Stores", "Confirmed Pair Rows", "Possible Pair Rows", "Unique Stores", "Matched Stores (counted once)", "Coverage Check (matched+unique==input)", "Matched Stores in Any Iteration", "Name Weight", "Location Weight", "Address Weight", "New Address Weight", "Confirmed Distance Gate", "Possible Extra Rule", "Per-File Split Sanity"],
-                "Value": [datetime.now().isoformat(timespec="seconds"), base_file, ", ".join(compare_files), total_input_stores, len(confirmed_pair_rows), len(possible_pair_rows), len(unique_rows), matched_store_count, coverage_status, len(all_iteration_matched_ids), NAME_WEIGHT, LOCATION_WEIGHT, ADDRESS_WEIGHT, NEW_ADDRESS_WEIGHT, f"<= {CONFIRMED_DISTANCE_M}m", "Distance<=30m and New Address similarity>=60 even without name match", "PASS" if all((confirmed_by_file[f] + possible_by_file[f] + unique_by_file[f]) == total_by_file[f] for f in report_files) else "FAIL"],
+                "Metric": ["Generated", "Base File", "Compared Files", "Total Input Stores", "BC Stage Raw Rows", "BC Stage Final Pairs", "BC→A Confirmed", "BC Not-In-A Possible", "Confirmed Pair Rows", "Possible Pair Rows", "Unique Stores", "Matched Stores (counted once)", "Coverage Check (matched+unique==input)", "Matched Stores in Any Iteration", "Name Weight", "Location Weight", "Address Weight", "New Address Weight", "Confirmed Distance Gate", "Possible Extra Rule", "Per-File Split Sanity"],
+                "Value": [datetime.now().isoformat(timespec="seconds"), base_file, ", ".join(compare_files), total_input_stores, len(bc_stage_rows), len(bc_pair_rows), len(bc_to_a_rows), len(bc_not_in_a_rows), len(confirmed_pair_rows), len(possible_pair_rows), len(unique_rows), matched_store_count, coverage_status, len(all_iteration_matched_ids), NAME_WEIGHT, LOCATION_WEIGHT, ADDRESS_WEIGHT, NEW_ADDRESS_WEIGHT, f"<= {CONFIRMED_DISTANCE_M}m", "Distance<=30m and New Address similarity>=60 even without name match", "PASS" if all((confirmed_by_file[f] + possible_by_file[f] + unique_by_file[f]) == total_by_file[f] for f in report_files) else "FAIL"],
             }
-        ).to_excel(writer, index=False, sheet_name="Summary", startrow=len(dashboard_rows) + 3)
+        ).to_excel(writer, index=False, sheet_name="Summary", startrow=meta_start)
+
+        reason_start = meta_start + 24
+        reason_df.to_excel(writer, index=False, sheet_name="Summary", startrow=reason_start)
 
         pd.DataFrame(add_mapping_codes(confirmed_pair_rows)).to_excel(writer, index=False, sheet_name="Confirmed_Matches")
         pd.DataFrame(add_mapping_codes(possible_pair_rows)).to_excel(writer, index=False, sheet_name="Possible_Matches")
         pd.DataFrame(unique_rows).to_excel(writer, index=False, sheet_name="Unique_Stores")
+        pd.DataFrame(_present_pair_rows(bc_stage_rows)).to_excel(writer, index=False, sheet_name="BC_Stage_Matches")
+        pd.DataFrame(add_mapping_codes(bc_to_a_rows)).to_excel(writer, index=False, sheet_name="BC_To_A_Matches")
+        pd.DataFrame(add_mapping_codes(bc_not_in_a_rows)).to_excel(writer, index=False, sheet_name="BC_NotInA_Matches")
 
     apply_excel_colors(out_path)
 
