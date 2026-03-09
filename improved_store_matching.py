@@ -797,6 +797,12 @@ def main() -> None:
             raw_strong.extend(build_output_rows(strong, df_a, df_b, file_a, file_b))
             raw_possible.extend(build_output_rows(possible, df_a, df_b, file_a, file_b))
 
+    # Track stores that matched in ANY iteration (before final dedupe/selection)
+    all_iteration_matched_ids: Set[Tuple[str, int]] = set()
+    for rr in raw_confirmed + raw_strong + raw_possible:
+        all_iteration_matched_ids.add((str(rr["A_File"]), int(rr["A_Idx"])))
+        all_iteration_matched_ids.add((str(rr["B_File"]), int(rr["B_Idx"])))
+
     # Normalize A<->B duplicates, then priority Confirmed > Strong > Possible, then one-to-one
     merged: Dict[Tuple[Tuple[str, int], Tuple[str, int]], Dict[str, object]] = {}
     for key, row in dedupe_match_rows(raw_possible, priority=3).items():
@@ -867,7 +873,8 @@ def main() -> None:
         possible_store_ids.add(a_id)
         possible_store_ids.add(b_id)
 
-    unique_store_ids = all_store_ids - confirmed_store_ids - possible_store_ids
+    # Unique means not matched in any iteration, and not in final possible fallback set
+    unique_store_ids = all_store_ids - all_iteration_matched_ids - possible_store_ids
     unique_rows: List[Dict[str, object]] = []
     for file_name, idx in sorted(unique_store_ids):
         row = files_data[file_name].iloc[idx]
@@ -882,7 +889,7 @@ def main() -> None:
         )
         unique_rows.append(rec)
 
-    matched_store_count = len(confirmed_store_ids | possible_store_ids)
+    matched_store_count = len(all_store_ids - unique_store_ids)
     coverage_status = "PASS" if (matched_store_count + len(unique_rows) == total_input_stores) else "FAIL"
 
     default_out = "/content/improved_bidirectional_matching.xlsx" if os.path.isdir("/content") else "improved_bidirectional_matching.xlsx"
@@ -960,6 +967,7 @@ def main() -> None:
                     "Unique Stores",
                     "Matched Stores (counted once)",
                     "Coverage Check (matched+unique==input)",
+                    "Matched Stores in Any Iteration",
                     "Name Weight",
                     "Location Weight",
                     "Address Weight",
@@ -977,6 +985,7 @@ def main() -> None:
                     len(unique_rows),
                     matched_store_count,
                     coverage_status,
+                    len(all_iteration_matched_ids),
                     NAME_WEIGHT,
                     LOCATION_WEIGHT,
                     ADDRESS_WEIGHT,
