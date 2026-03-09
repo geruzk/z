@@ -161,3 +161,54 @@ And pair this with anti-false-positive guards:
 - Cleaner separation between matched and unique stores.
 - Better auditability for business users.
 
+
+---
+
+## How to validate the output now (quick checklist)
+
+1. **Run the script and check the console coverage line**
+   - Expect: `Coverage: PASS` and `MatchedStores + Unique == Total Input`.
+2. **Check the `Summary` sheet sanity rows**
+   - `Coverage Check (matched+unique==input)` should be `PASS`.
+   - `Per-File Split Sanity` should be `PASS`.
+3. **Audit a small human sample from each segment**
+   - Review 30 rows from `Confirmed_Matches`.
+   - Review 30 rows from `Possible_Matches`.
+   - Review 30 rows from `Unique_Stores`.
+4. **Watch reason code drift**
+   - If `POSSIBLE_DIST<=30_AND_NEWADDR` dominates too much, review those first.
+
+Recommended run command:
+
+```bash
+MATCH_STAGE_MODE=all MATCH_OUTPUT_PATH=./improved_bidirectional_matching.xlsx python improved_store_matching.py
+```
+
+## How to increase segmentation counts **without changing thresholds**
+
+You can increase candidate coverage while keeping thresholds unchanged:
+
+1. **Increase candidate breadth per store** with `MAX_CANDIDATES` (default `60`).
+   - Example:
+
+```bash
+MAX_CANDIDATES=120 MATCH_STAGE_MODE=all python improved_store_matching.py
+```
+
+2. **Keep full pipeline mode** (`MATCH_STAGE_MODE=all`) so BC-stage and direct matching both contribute.
+3. **Rotate base file and compare unioned results** (A as base, then B as base, etc.) to recover asymmetric misses.
+4. **Improve source text completeness** (store name/address quality) before matching; this boosts segmentation naturally without threshold edits.
+
+## Output tabs control
+
+By default, output stops at:
+- `Summary`
+- `Confirmed_Matches`
+- `Possible_Matches`
+- `Unique_Stores`
+
+If you still need BC diagnostic tabs, enable:
+
+```bash
+MATCH_INCLUDE_EXTRA_TABS=1 python improved_store_matching.py
+```

@@ -32,7 +32,7 @@ STRONG_POSSIBLE_DISTANCE_M = 60
 POSSIBLE_DISTANCE_M = 100
 HARD_VETO_DISTANCE_M = 200
 HARD_VETO_NAME_MIN = 5
-MAX_CANDIDATES = 60
+MAX_CANDIDATES = int(os.environ.get("MAX_CANDIDATES", "60"))
 
 # Requested weights
 NAME_WEIGHT = 0.15
@@ -1037,6 +1037,7 @@ def main() -> None:
 
     default_out = "/content/improved_bidirectional_matching.xlsx" if os.path.isdir("/content") else "improved_bidirectional_matching.xlsx"
     out_path = str(Path(os.environ.get("MATCH_OUTPUT_PATH", default_out)).expanduser().resolve())
+    include_extra_tabs = os.environ.get("MATCH_INCLUDE_EXTRA_TABS", "0").strip().lower() in {"1", "true", "yes"}
 
     report_files = [base_file] + compare_files
     confirmed_ids = set((str(r["A_File"]), int(r["A_Idx"])) for r in confirmed_pair_rows) | set((str(r["B_File"]), int(r["B_Idx"])) for r in confirmed_pair_rows)
@@ -1093,18 +1094,20 @@ def main() -> None:
         meta_start = len(dashboard_rows) + 3
         pd.DataFrame(
             {
-                "Metric": ["Generated", "Run Mode", "BC Stage File", "Base File", "Compared Files", "Total Input Stores", "BC Stage Final Pairs", "BC→A Confirmed", "Confirmed Pair Rows", "Possible Pair Rows", "Unique Stores", "Matched Stores (counted once)", "Coverage Check (matched+unique==input)", "Matched Stores in Any Iteration", "Name Weight", "Location Weight", "Address Weight", "New Address Weight", "Confirmed Distance Gate", "Possible Extra Rule", "Per-File Split Sanity"],
-                "Value": [datetime.now().isoformat(timespec="seconds"), stage_mode, bc_stage_path, base_file, ", ".join(compare_files), total_input_stores, len(bc_pair_rows), len(bc_to_a_rows), len(confirmed_pair_rows), len(possible_pair_rows), len(unique_rows), matched_store_count, coverage_status, len(all_iteration_matched_ids), NAME_WEIGHT, LOCATION_WEIGHT, ADDRESS_WEIGHT, NEW_ADDRESS_WEIGHT, f"<= {CONFIRMED_DISTANCE_M}m", "Distance<=30m and New Address similarity>=60 even without name match", "PASS" if all((confirmed_by_file[f] + possible_by_file[f] + unique_by_file[f]) == total_by_file[f] for f in report_files) else "FAIL"],
+                "Metric": ["Generated", "Run Mode", "BC Stage File", "Base File", "Compared Files", "Total Input Stores", "BC Stage Final Pairs", "BC→A Confirmed", "Confirmed Pair Rows", "Possible Pair Rows", "Unique Stores", "Matched Stores (counted once)", "Coverage Check (matched+unique==input)", "Matched Stores in Any Iteration", "Name Weight", "Location Weight", "Address Weight", "New Address Weight", "Confirmed Distance Gate", "Possible Extra Rule", "Per-File Split Sanity", "MAX_CANDIDATES", "Include Extra Tabs"],
+                "Value": [datetime.now().isoformat(timespec="seconds"), stage_mode, bc_stage_path, base_file, ", ".join(compare_files), total_input_stores, len(bc_pair_rows), len(bc_to_a_rows), len(confirmed_pair_rows), len(possible_pair_rows), len(unique_rows), matched_store_count, coverage_status, len(all_iteration_matched_ids), NAME_WEIGHT, LOCATION_WEIGHT, ADDRESS_WEIGHT, NEW_ADDRESS_WEIGHT, f"<= {CONFIRMED_DISTANCE_M}m", "Distance<=30m and New Address similarity>=60 even without name match", "PASS" if all((confirmed_by_file[f] + possible_by_file[f] + unique_by_file[f]) == total_by_file[f] for f in report_files) else "FAIL", MAX_CANDIDATES, "Yes" if include_extra_tabs else "No"],
             }
         ).to_excel(writer, index=False, sheet_name="Summary", startrow=meta_start)
 
-        reason_df.to_excel(writer, index=False, sheet_name="Summary", startrow=meta_start + 24)
+        reason_df.to_excel(writer, index=False, sheet_name="Summary", startrow=meta_start + 26)
 
         pd.DataFrame(add_mapping_codes(confirmed_pair_rows)).to_excel(writer, index=False, sheet_name="Confirmed_Matches")
         pd.DataFrame(add_mapping_codes(possible_pair_rows)).to_excel(writer, index=False, sheet_name="Possible_Matches")
         pd.DataFrame(unique_rows).to_excel(writer, index=False, sheet_name="Unique_Stores")
-        pd.DataFrame(_present_pair_rows(bc_pair_rows)).to_excel(writer, index=False, sheet_name="BC_Stage_Matches")
-        pd.DataFrame(add_mapping_codes(bc_to_a_rows)).to_excel(writer, index=False, sheet_name="BC_To_A_Matches")
+
+        if include_extra_tabs:
+            pd.DataFrame(_present_pair_rows(bc_pair_rows)).to_excel(writer, index=False, sheet_name="BC_Stage_Matches")
+            pd.DataFrame(add_mapping_codes(bc_to_a_rows)).to_excel(writer, index=False, sheet_name="BC_To_A_Matches")
 
     apply_excel_colors(out_path)
 
