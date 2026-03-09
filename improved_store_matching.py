@@ -870,9 +870,11 @@ def main() -> None:
         bc_raw_strong: List[Dict[str, object]] = []
         bc_raw_possible: List[Dict[str, object]] = []
 
-        for i in range(len(compare_files)):
-            for j in range(i + 1, len(compare_files)):
-                f1, f2 = compare_files[i], compare_files[j]
+        stage1_files = sorted(compare_files, key=lambda f: len(files_data[f]), reverse=True)
+        print("[Stage 1] Compare order by row count:", " -> ".join(f"{f}({len(files_data[f])})" for f in stage1_files))
+        for i in range(len(stage1_files)):
+            for j in range(i + 1, len(stage1_files)):
+                f1, f2 = stage1_files[i], stage1_files[j]
                 df1, df2 = files_data[f1].copy(), files_data[f2].copy()
                 c, s2, p2, _, _ = run_phase(df1, df2, f"{f1}→{f2}")
                 bc_raw_confirmed.extend(build_output_rows(c, df1, df2, f1, f2))
@@ -920,8 +922,8 @@ def main() -> None:
             pd.DataFrame(bc_unique_rows).to_excel(writer, index=False, sheet_name="BC_Unique_Stores")
             pd.DataFrame(
                 {
-                    "Metric": ["Generated", "Run Mode", "Compared Files", "BC Stage Final Pairs", "BC Stage Confirmed Pairs", "BC Stage Possible Pairs", "BC Stage Unique Stores"],
-                    "Value": [datetime.now().isoformat(timespec="seconds"), stage_mode, ", ".join(compare_files), len(bc_pair_rows), bc_stage_confirmed_count, bc_stage_possible_count, len(bc_unique_rows)],
+                    "Metric": ["Generated", "Run Mode", "Compared Files", "BC Stage Final Pairs", "BC Stage Confirmed Pairs", "BC Stage Possible Pairs", "BC Stage Unique Stores", "BC Stage Name Weight", "BC Stage Location Weight", "BC Stage Address Weight", "BC Stage New Address Weight", "BC Confirmed Distance Gate", "BC Strong Possible Distance Gate", "BC Possible Distance Gate"],
+                    "Value": [datetime.now().isoformat(timespec="seconds"), stage_mode, ", ".join(compare_files), len(bc_pair_rows), bc_stage_confirmed_count, bc_stage_possible_count, len(bc_unique_rows), NAME_WEIGHT, LOCATION_WEIGHT, ADDRESS_WEIGHT, NEW_ADDRESS_WEIGHT, f"<= {CONFIRMED_DISTANCE_M}m", f"<= {STRONG_POSSIBLE_DISTANCE_M}m", f"<= {POSSIBLE_DISTANCE_M}m"],
                 }
             ).to_excel(writer, index=False, sheet_name="BC_Summary")
         print(f"[Stage 1] Exported BC stage artifact: {bc_stage_path}")
@@ -943,13 +945,33 @@ def main() -> None:
 
     # ---------- Stage 2: map BC and remaining stores to A ----------
     bc_store_ids: Set[Tuple[str, int]] = set()
-    bc_peer_map: Dict[Tuple[str, int], Tuple[str, int, object]] = {}
+    bc_peer_map: Dict[Tuple[str, int], Dict[str, object]] = {}
     for r in bc_pair_rows:
         a = (str(r["A_File"]), int(r["A_Idx"]))
         b = (str(r["B_File"]), int(r["B_Idx"]))
         bc_store_ids.update([a, b])
-        bc_peer_map[a] = (b[0], b[1], r.get("B_Customer Code", ""))
-        bc_peer_map[b] = (a[0], a[1], r.get("A_Customer Code", ""))
+        common = {
+            "BC_Link_Confidence": r.get("Confidence", ""),
+            "BC_Link_Reason_Code": r.get("Reason_Code", ""),
+            "BC_Link_Name Score (%)": r.get("Name Score (%)"),
+            "BC_Link_Address Score (%)": r.get("Address Score (%)"),
+            "BC_Link_New Address Score (%)": r.get("New Address Score (%)"),
+            "BC_Link_Location Score (%)": r.get("Location Score (%)"),
+            "BC_Link_Distance (m)": r.get("Distance (m)"),
+            "BC_Link_Weighted Score (%)": r.get("Weighted Score (%)"),
+        }
+        bc_peer_map[a] = {
+            "peer_file": b[0],
+            "peer_idx": b[1],
+            "peer_code": r.get("B_Customer Code", ""),
+            **common,
+        }
+        bc_peer_map[b] = {
+            "peer_file": a[0],
+            "peer_idx": a[1],
+            "peer_code": r.get("A_Customer Code", ""),
+            **common,
+        }
 
     print("[Stage 2] Rechecking B/C results against base A...")
     a_link_candidates: List[Dict[str, object]] = []
@@ -962,7 +984,10 @@ def main() -> None:
         if rec is None:
             continue
         if sid in bc_peer_map:
-            pf, pidx, pcode = bc_peer_map[sid]
+            peer_info = bc_peer_map[sid]
+            pf = str(peer_info.get("peer_file", ""))
+            pidx = int(peer_info.get("peer_idx", -1))
+            pcode = peer_info.get("peer_code", "")
             rec["BC_Peer_File"] = pf
             rec["BC_Peer_Idx"] = pidx
             rec["BC_Peer_Code"] = pcode
@@ -973,6 +998,19 @@ def main() -> None:
             rec["BC_Peer_longitude"] = peer_row.get("longitude", "")
             rec["BC_Peer_latitude"] = peer_row.get("latitude", "")
             rec["BC_Peer_Address_English"] = peer_row.get("Address_English", "")
+            rec["BC_Peer_Map_Code_File_A"] = rec.get("BC_Peer_Customer_Code", "") if pf == "File A" else ""
+            rec["BC_Peer_Map_Code_File_B"] = rec.get("BC_Peer_Customer_Code", "") if pf == "File B" else ""
+            rec["BC_Peer_Map_Code_File_C"] = rec.get("BC_Peer_Customer_Code", "") if pf == "File C" else ""
+            rec.update({
+                "BC_Link_Confidence": peer_info.get("BC_Link_Confidence", ""),
+                "BC_Link_Reason_Code": peer_info.get("BC_Link_Reason_Code", ""),
+                "BC_Link_Name Score (%)": peer_info.get("BC_Link_Name Score (%)"),
+                "BC_Link_Address Score (%)": peer_info.get("BC_Link_Address Score (%)"),
+                "BC_Link_New Address Score (%)": peer_info.get("BC_Link_New Address Score (%)"),
+                "BC_Link_Location Score (%)": peer_info.get("BC_Link_Location Score (%)"),
+                "BC_Link_Distance (m)": peer_info.get("BC_Link_Distance (m)"),
+                "BC_Link_Weighted Score (%)": peer_info.get("BC_Link_Weighted Score (%)"),
+            })
             rec["Reason_Code"] = "BC_TO_A_MATCH"
             bc_to_a_rows.append(dict(rec))
         a_link_candidates.append(rec)
