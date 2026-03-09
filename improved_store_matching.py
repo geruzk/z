@@ -838,6 +838,8 @@ def _best_match_store_to_base(store_row: pd.Series, store_file: str, base_df: pd
 
 
 
+
+
 def main() -> None:
     files_data = read_input_files()
     if len(files_data) < 2:
@@ -851,51 +853,67 @@ def main() -> None:
     base_tree, base_idx_map = build_balltree(base_df, cols_base.get("lat") or "", cols_base.get("lng") or "")
     cols_by_file: Dict[str, Dict[str, Optional[str]]] = {f: resolve_columns(files_data[f]) for f in compare_files}
 
-    all_store_ids: Set[Tuple[str, int]] = set()
-    for fn in file_names:
-        for idx in files_data[fn].index:
-            all_store_ids.add((fn, int(idx)))
+    stage_mode = os.environ.get("MATCH_STAGE_MODE", "all").strip().lower()  # all | stage1 | stage2
+    default_bc_path = "/content/bc_stage_output.xlsx" if os.path.isdir("/content") else "bc_stage_output.xlsx"
+    bc_stage_path = str(Path(os.environ.get("BC_STAGE_PATH", default_bc_path)).expanduser().resolve())
+
+    all_store_ids: Set[Tuple[str, int]] = {(fn, int(idx)) for fn in file_names for idx in files_data[fn].index}
     total_input_stores = len(all_store_ids)
 
-    # Step 1: Match among non-base files first (B<->C style)
-    bc_raw_confirmed: List[Dict[str, object]] = []
-    bc_raw_strong: List[Dict[str, object]] = []
-    bc_raw_possible: List[Dict[str, object]] = []
-    bc_stage_rows: List[Dict[str, object]] = []
-    bc_to_a_rows: List[Dict[str, object]] = []
-    bc_not_in_a_rows: List[Dict[str, object]] = []
+    # ---------- Stage 1: B<->C matching and export ----------
+    bc_pair_rows: List[Dict[str, object]] = []
+    if stage_mode in ("all", "stage1"):
+        print("[Stage 1] Matching compare files (e.g., B↔C)...")
+        bc_raw_confirmed: List[Dict[str, object]] = []
+        bc_raw_strong: List[Dict[str, object]] = []
+        bc_raw_possible: List[Dict[str, object]] = []
 
-    print("[Stage 1] Matching compare files (e.g., B↔C)...")
-    for i in range(len(compare_files)):
-        for j in range(i + 1, len(compare_files)):
-            f1, f2 = compare_files[i], compare_files[j]
-            df1, df2 = files_data[f1].copy(), files_data[f2].copy()
-            c, s2, p2, _, _ = run_phase(df1, df2, f"{f1}→{f2}")
-            c_rows = build_output_rows(c, df1, df2, f1, f2)
-            s_rows = build_output_rows(s2, df1, df2, f1, f2)
-            p_rows = build_output_rows(p2, df1, df2, f1, f2)
-            bc_raw_confirmed.extend(c_rows)
-            bc_raw_strong.extend(s_rows)
-            bc_raw_possible.extend(p_rows)
-            bc_stage_rows.extend(c_rows + s_rows + p_rows)
+        for i in range(len(compare_files)):
+            for j in range(i + 1, len(compare_files)):
+                f1, f2 = compare_files[i], compare_files[j]
+                df1, df2 = files_data[f1].copy(), files_data[f2].copy()
+                c, s2, p2, _, _ = run_phase(df1, df2, f"{f1}→{f2}")
+                bc_raw_confirmed.extend(build_output_rows(c, df1, df2, f1, f2))
+                bc_raw_strong.extend(build_output_rows(s2, df1, df2, f1, f2))
+                bc_raw_possible.extend(build_output_rows(p2, df1, df2, f1, f2))
 
-    merged_bc: Dict[Tuple[Tuple[str, int], Tuple[str, int]], Dict[str, object]] = {}
-    for key, row in dedupe_match_rows(bc_raw_possible, priority=3).items():
-        merged_bc[key] = row
-    for key, row in dedupe_match_rows(bc_raw_strong, priority=2).items():
-        old = merged_bc.get(key)
-        if old is None or row["_priority"] < old["_priority"] or (row["_priority"] == old["_priority"] and float(row.get("Weighted Score (%)", 0) or 0) > float(old.get("Weighted Score (%)", 0) or 0)):
+        merged_bc: Dict[Tuple[Tuple[str, int], Tuple[str, int]], Dict[str, object]] = {}
+        for key, row in dedupe_match_rows(bc_raw_possible, priority=3).items():
             merged_bc[key] = row
-    for key, row in dedupe_match_rows(bc_raw_confirmed, priority=1).items():
-        old = merged_bc.get(key)
-        if old is None or row["_priority"] < old["_priority"] or (row["_priority"] == old["_priority"] and float(row.get("Weighted Score (%)", 0) or 0) > float(old.get("Weighted Score (%)", 0) or 0)):
-            merged_bc[key] = row
+        for key, row in dedupe_match_rows(bc_raw_strong, priority=2).items():
+            old = merged_bc.get(key)
+            if old is None or row["_priority"] < old["_priority"] or (row["_priority"] == old["_priority"] and float(row.get("Weighted Score (%)", 0) or 0) > float(old.get("Weighted Score (%)", 0) or 0)):
+                merged_bc[key] = row
+        for key, row in dedupe_match_rows(bc_raw_confirmed, priority=1).items():
+            old = merged_bc.get(key)
+            if old is None or row["_priority"] < old["_priority"] or (row["_priority"] == old["_priority"] and float(row.get("Weighted Score (%)", 0) or 0) > float(old.get("Weighted Score (%)", 0) or 0)):
+                merged_bc[key] = row
 
-    bc_pair_rows = one_to_one_global(list(merged_bc.values()))
-    print(f"[Stage 1] Raw B/C candidates: {len(bc_stage_rows)} | Final B/C pairs after dedupe: {len(bc_pair_rows)}")
-    for r in bc_pair_rows:
-        r.pop("_priority", None)
+        bc_pair_rows = one_to_one_global(list(merged_bc.values()))
+        for r in bc_pair_rows:
+            r.pop("_priority", None)
 
+        print(f"[Stage 1] Final B/C pairs after dedupe: {len(bc_pair_rows)}")
+        # Persist stage1 artifact for explicit 2-step pipeline
+        with pd.ExcelWriter(bc_stage_path, engine="openpyxl") as writer:
+            pd.DataFrame(bc_pair_rows).to_excel(writer, index=False, sheet_name="BC_Pairs")
+            pd.DataFrame(_present_pair_rows(bc_pair_rows)).to_excel(writer, index=False, sheet_name="BC_Pairs_Presented")
+        print(f"[Stage 1] Exported BC stage artifact: {bc_stage_path}")
+
+        if stage_mode == "stage1":
+            return
+
+    if stage_mode == "stage2":
+        if not os.path.exists(bc_stage_path):
+            raise RuntimeError(f"Stage2 requires BC stage file not found: {bc_stage_path}")
+        bc_pair_rows = pd.read_excel(bc_stage_path, sheet_name="BC_Pairs", dtype=str).to_dict("records")
+        # normalize numeric IDs
+        for r in bc_pair_rows:
+            r["A_Idx"] = int(float(r.get("A_Idx", -1)))
+            r["B_Idx"] = int(float(r.get("B_Idx", -1)))
+        print(f"[Stage 2] Loaded BC pairs from artifact: {len(bc_pair_rows)}")
+
+    # ---------- Stage 2: map BC and remaining stores to A ----------
     bc_store_ids: Set[Tuple[str, int]] = set()
     bc_peer_map: Dict[Tuple[str, int], Tuple[str, int, object]] = {}
     for r in bc_pair_rows:
@@ -905,9 +923,10 @@ def main() -> None:
         bc_peer_map[a] = (b[0], b[1], r.get("B_Customer Code", ""))
         bc_peer_map[b] = (a[0], a[1], r.get("A_Customer Code", ""))
 
-    # Step 2: Match B/C results to base A
     print("[Stage 2] Rechecking B/C results against base A...")
     a_link_candidates: List[Dict[str, object]] = []
+    bc_to_a_rows: List[Dict[str, object]] = []
+
     for sid in sorted(bc_store_ids):
         sf, sidx = sid
         store_row = files_data[sf].iloc[sidx]
@@ -927,11 +946,9 @@ def main() -> None:
             rec["BC_Peer_latitude"] = peer_row.get("latitude", "")
             rec["BC_Peer_Address_English"] = peer_row.get("Address_English", "")
             rec["Reason_Code"] = "BC_TO_A_MATCH"
+            bc_to_a_rows.append(dict(rec))
         a_link_candidates.append(rec)
 
-    print(f"[Stage 2] BC→A matches: {len(bc_to_a_rows)} | BC duplicates not in A: {len(bc_not_in_a_rows)}")
-
-    # Also match remaining compare-file stores directly to A
     remaining_compare_ids = {(f, int(i)) for f in compare_files for i in files_data[f].index} - bc_store_ids
     for sid in sorted(remaining_compare_ids):
         sf, sidx = sid
@@ -940,7 +957,6 @@ def main() -> None:
             rec["Reason_Code"] = rec.get("Reason_Code", "DIRECT_TO_A")
             a_link_candidates.append(rec)
 
-    # Final dedupe one-to-one across A and compare stores
     final_rows = one_to_one_global(a_link_candidates)
     print(f"[Stage 2] A-link candidates: {len(a_link_candidates)} | Final one-to-one A links: {len(final_rows)}")
 
@@ -960,11 +976,11 @@ def main() -> None:
         else:
             possible_pair_rows.append(r)
 
-    # Unique after all iterations (BC + A-link + fallback)
+    # ---------- Stage 3: fallback possible ----------
     unmatched_after_final = all_store_ids - matched_store_ids
     fallback_pairs = build_possible_pairs_from_unmatched(files_data, unmatched_after_final, new_addr_threshold=60.0)
+    fallback_added = 0
     for a_id, b_id, naddr_score, dist_m in fallback_pairs:
-        # keep A-anchored fallback only
         if a_id[0] == base_file:
             a_file, a_idx = a_id
             b_file, b_idx = b_id
@@ -1004,8 +1020,9 @@ def main() -> None:
         possible_pair_rows.append(rec)
         matched_store_ids.update([(a_file, int(a_idx)), (b_file, int(b_idx))])
         all_iteration_matched_ids.update([(a_file, int(a_idx)), (b_file, int(b_idx))])
+        fallback_added += 1
 
-    print(f"[Stage 3] Possible fallback pairs added: {len(possible_pair_rows)}")
+    print(f"[Stage 3] Possible fallback pairs added: {fallback_added}")
 
     unique_store_ids = all_store_ids - all_iteration_matched_ids
     unique_rows: List[Dict[str, object]] = []
@@ -1019,10 +1036,8 @@ def main() -> None:
     coverage_status = "PASS" if (matched_store_count + len(unique_rows) == total_input_stores) else "FAIL"
 
     default_out = "/content/improved_bidirectional_matching.xlsx" if os.path.isdir("/content") else "improved_bidirectional_matching.xlsx"
-    out_path = os.environ.get("MATCH_OUTPUT_PATH", default_out)
-    out_path = str(Path(out_path).expanduser().resolve())
+    out_path = str(Path(os.environ.get("MATCH_OUTPUT_PATH", default_out)).expanduser().resolve())
 
-    # Dashboard table (base + compared files + total)
     report_files = [base_file] + compare_files
     confirmed_ids = set((str(r["A_File"]), int(r["A_Idx"])) for r in confirmed_pair_rows) | set((str(r["B_File"]), int(r["B_Idx"])) for r in confirmed_pair_rows)
     possible_ids = set((str(r["A_File"]), int(r["A_Idx"])) for r in possible_pair_rows) | set((str(r["B_File"]), int(r["B_Idx"])) for r in possible_pair_rows)
@@ -1046,7 +1061,6 @@ def main() -> None:
     u_tot = sum(unique_by_file.values())
     t_tot = sum(total_by_file.values())
     dashboard_data["Total"] = [c_tot, p_tot, u_tot, t_tot, pct(c_tot, t_tot), pct(c_tot + p_tot, t_tot)]
-
     dashboard_df = pd.DataFrame(dashboard_data, index=dashboard_rows).reset_index().rename(columns={"index": "Metric"})
 
     reason_rows = confirmed_pair_rows + possible_pair_rows
@@ -1058,37 +1072,15 @@ def main() -> None:
 
     def add_mapping_codes(rows: List[Dict[str, object]]) -> List[Dict[str, object]]:
         out = []
-        score_cols = [
-            "Name Score (%)",
-            "Address Score (%)",
-            "New Address Score (%)",
-            "Location Score (%)",
-            "Distance (m)",
-            "Weighted Score (%)",
-        ]
-        hide_cols = {
-            "BC_Peer_Idx",
-            "BC_Peer_Code",
-            "Pair_Store_1_ID",
-            "Pair_Store_2_ID",
-            "Store_1_File",
-            "Store_1_Idx",
-            "Store_2_File",
-            "Store_2_Idx",
-            "Shared_Generic_Tokens",
-            "Shared_Distinctive_Tokens",
-            "Comparison",
-        }
-
+        score_cols = ["Name Score (%)", "Address Score (%)", "New Address Score (%)", "Location Score (%)", "Distance (m)", "Weighted Score (%)"]
+        hide_cols = {"BC_Peer_Idx", "BC_Peer_Code", "Pair_Store_1_ID", "Pair_Store_2_ID", "Store_1_File", "Store_1_Idx", "Store_2_File", "Store_2_Idx", "Shared_Generic_Tokens", "Shared_Distinctive_Tokens", "Comparison"}
         for r in _present_pair_rows(rows):
             rr = dict(r)
             rr["Map_Code_File_A"] = rr.get("Store_1_Customer Code") if rr.get("Store_1_File") == "File A" else rr.get("Store_2_Customer Code") if rr.get("Store_2_File") == "File A" else ""
             rr["Map_Code_File_B"] = rr.get("Store_1_Customer Code") if rr.get("Store_1_File") == "File B" else rr.get("Store_2_Customer Code") if rr.get("Store_2_File") == "File B" else rr.get("BC_Peer_Customer_Code", "") if rr.get("BC_Peer_File") == "File B" else ""
             rr["Map_Code_File_C"] = rr.get("Store_1_Customer Code") if rr.get("Store_1_File") == "File C" else rr.get("Store_2_Customer Code") if rr.get("Store_2_File") == "File C" else rr.get("BC_Peer_Customer_Code", "") if rr.get("BC_Peer_File") == "File C" else ""
-
             for c in list(hide_cols):
                 rr.pop(c, None)
-
             ordered = {k: v for k, v in rr.items() if k not in score_cols}
             for c in score_cols:
                 if c in rr:
@@ -1101,20 +1093,18 @@ def main() -> None:
         meta_start = len(dashboard_rows) + 3
         pd.DataFrame(
             {
-                "Metric": ["Generated", "Base File", "Compared Files", "Total Input Stores", "BC Stage Raw Rows", "BC Stage Final Pairs", "BC→A Confirmed", "BC Not-In-A Possible", "Confirmed Pair Rows", "Possible Pair Rows", "Unique Stores", "Matched Stores (counted once)", "Coverage Check (matched+unique==input)", "Matched Stores in Any Iteration", "Name Weight", "Location Weight", "Address Weight", "New Address Weight", "Confirmed Distance Gate", "Possible Extra Rule", "Per-File Split Sanity"],
-                "Value": [datetime.now().isoformat(timespec="seconds"), base_file, ", ".join(compare_files), total_input_stores, len(bc_stage_rows), len(bc_pair_rows), len(bc_to_a_rows), len(bc_not_in_a_rows), len(confirmed_pair_rows), len(possible_pair_rows), len(unique_rows), matched_store_count, coverage_status, len(all_iteration_matched_ids), NAME_WEIGHT, LOCATION_WEIGHT, ADDRESS_WEIGHT, NEW_ADDRESS_WEIGHT, f"<= {CONFIRMED_DISTANCE_M}m", "Distance<=30m and New Address similarity>=60 even without name match", "PASS" if all((confirmed_by_file[f] + possible_by_file[f] + unique_by_file[f]) == total_by_file[f] for f in report_files) else "FAIL"],
+                "Metric": ["Generated", "Run Mode", "BC Stage File", "Base File", "Compared Files", "Total Input Stores", "BC Stage Final Pairs", "BC→A Confirmed", "Confirmed Pair Rows", "Possible Pair Rows", "Unique Stores", "Matched Stores (counted once)", "Coverage Check (matched+unique==input)", "Matched Stores in Any Iteration", "Name Weight", "Location Weight", "Address Weight", "New Address Weight", "Confirmed Distance Gate", "Possible Extra Rule", "Per-File Split Sanity"],
+                "Value": [datetime.now().isoformat(timespec="seconds"), stage_mode, bc_stage_path, base_file, ", ".join(compare_files), total_input_stores, len(bc_pair_rows), len(bc_to_a_rows), len(confirmed_pair_rows), len(possible_pair_rows), len(unique_rows), matched_store_count, coverage_status, len(all_iteration_matched_ids), NAME_WEIGHT, LOCATION_WEIGHT, ADDRESS_WEIGHT, NEW_ADDRESS_WEIGHT, f"<= {CONFIRMED_DISTANCE_M}m", "Distance<=30m and New Address similarity>=60 even without name match", "PASS" if all((confirmed_by_file[f] + possible_by_file[f] + unique_by_file[f]) == total_by_file[f] for f in report_files) else "FAIL"],
             }
         ).to_excel(writer, index=False, sheet_name="Summary", startrow=meta_start)
 
-        reason_start = meta_start + 24
-        reason_df.to_excel(writer, index=False, sheet_name="Summary", startrow=reason_start)
+        reason_df.to_excel(writer, index=False, sheet_name="Summary", startrow=meta_start + 24)
 
         pd.DataFrame(add_mapping_codes(confirmed_pair_rows)).to_excel(writer, index=False, sheet_name="Confirmed_Matches")
         pd.DataFrame(add_mapping_codes(possible_pair_rows)).to_excel(writer, index=False, sheet_name="Possible_Matches")
         pd.DataFrame(unique_rows).to_excel(writer, index=False, sheet_name="Unique_Stores")
-        pd.DataFrame(_present_pair_rows(bc_stage_rows)).to_excel(writer, index=False, sheet_name="BC_Stage_Matches")
+        pd.DataFrame(_present_pair_rows(bc_pair_rows)).to_excel(writer, index=False, sheet_name="BC_Stage_Matches")
         pd.DataFrame(add_mapping_codes(bc_to_a_rows)).to_excel(writer, index=False, sheet_name="BC_To_A_Matches")
-        pd.DataFrame(add_mapping_codes(bc_not_in_a_rows)).to_excel(writer, index=False, sheet_name="BC_NotInA_Matches")
 
     apply_excel_colors(out_path)
 
