@@ -847,6 +847,9 @@ def main() -> None:
     base_file = "File A" if "File A" in file_names else file_names[0]
     compare_files = [f for f in file_names if f != base_file]
     base_df = files_data[base_file].copy()
+    cols_base = resolve_columns(base_df)
+    base_tree, base_idx_map = build_balltree(base_df, cols_base.get("lat") or "", cols_base.get("lng") or "")
+    cols_by_file: Dict[str, Dict[str, Optional[str]]] = {f: resolve_columns(files_data[f]) for f in compare_files}
 
     all_store_ids: Set[Tuple[str, int]] = set()
     for fn in file_names:
@@ -906,6 +909,13 @@ def main() -> None:
             rec["BC_Peer_File"] = pf
             rec["BC_Peer_Idx"] = pidx
             rec["BC_Peer_Code"] = pcode
+            peer_row = files_data[pf].iloc[pidx]
+            rec["BC_Peer_Customer_Code"] = peer_row.get("Customer Code", "")
+            rec["BC_Peer_store_name"] = peer_row.get("store_name", "")
+            rec["BC_Peer_store_address"] = peer_row.get("store_address", "")
+            rec["BC_Peer_longitude"] = peer_row.get("longitude", "")
+            rec["BC_Peer_latitude"] = peer_row.get("latitude", "")
+            rec["BC_Peer_Address_English"] = peer_row.get("Address_English", "")
             rec["Reason_Code"] = "BC_TO_A_MATCH"
         a_link_candidates.append(rec)
 
@@ -1026,20 +1036,50 @@ def main() -> None:
 
     def add_mapping_codes(rows: List[Dict[str, object]]) -> List[Dict[str, object]]:
         out = []
+        score_cols = [
+            "Name Score (%)",
+            "Address Score (%)",
+            "New Address Score (%)",
+            "Location Score (%)",
+            "Distance (m)",
+            "Weighted Score (%)",
+        ]
+        hide_cols = {
+            "BC_Peer_Idx",
+            "BC_Peer_Code",
+            "Pair_Store_1_ID",
+            "Pair_Store_2_ID",
+            "Store_1_File",
+            "Store_1_Idx",
+            "Store_2_File",
+            "Store_2_Idx",
+            "Shared_Generic_Tokens",
+            "Shared_Distinctive_Tokens",
+            "Comparison",
+        }
+
         for r in _present_pair_rows(rows):
             rr = dict(r)
             rr["Map_Code_File_A"] = rr.get("Store_1_Customer Code") if rr.get("Store_1_File") == "File A" else rr.get("Store_2_Customer Code") if rr.get("Store_2_File") == "File A" else ""
-            rr["Map_Code_File_B"] = rr.get("Store_1_Customer Code") if rr.get("Store_1_File") == "File B" else rr.get("Store_2_Customer Code") if rr.get("Store_2_File") == "File B" else rr.get("BC_Peer_Code", "") if rr.get("BC_Peer_File") == "File B" else ""
-            rr["Map_Code_File_C"] = rr.get("Store_1_Customer Code") if rr.get("Store_1_File") == "File C" else rr.get("Store_2_Customer Code") if rr.get("Store_2_File") == "File C" else rr.get("BC_Peer_Code", "") if rr.get("BC_Peer_File") == "File C" else ""
-            out.append(rr)
+            rr["Map_Code_File_B"] = rr.get("Store_1_Customer Code") if rr.get("Store_1_File") == "File B" else rr.get("Store_2_Customer Code") if rr.get("Store_2_File") == "File B" else rr.get("BC_Peer_Customer_Code", "") if rr.get("BC_Peer_File") == "File B" else ""
+            rr["Map_Code_File_C"] = rr.get("Store_1_Customer Code") if rr.get("Store_1_File") == "File C" else rr.get("Store_2_Customer Code") if rr.get("Store_2_File") == "File C" else rr.get("BC_Peer_Customer_Code", "") if rr.get("BC_Peer_File") == "File C" else ""
+
+            for c in list(hide_cols):
+                rr.pop(c, None)
+
+            ordered = {k: v for k, v in rr.items() if k not in score_cols}
+            for c in score_cols:
+                if c in rr:
+                    ordered[c] = rr[c]
+            out.append(ordered)
         return out
 
     with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
         dashboard_df.to_excel(writer, index=False, sheet_name="Summary", startrow=0)
         pd.DataFrame(
             {
-                "Metric": ["Generated", "Base File", "Compared Files", "Total Input Stores", "Confirmed Pair Rows", "Possible Pair Rows", "Unique Stores", "Matched Stores (counted once)", "Coverage Check (matched+unique==input)", "Matched Stores in Any Iteration", "Name Weight", "Location Weight", "Address Weight", "New Address Weight", "Confirmed Distance Gate", "Possible Extra Rule"],
-                "Value": [datetime.now().isoformat(timespec="seconds"), base_file, ", ".join(compare_files), total_input_stores, len(confirmed_pair_rows), len(possible_pair_rows), len(unique_rows), matched_store_count, coverage_status, len(all_iteration_matched_ids), NAME_WEIGHT, LOCATION_WEIGHT, ADDRESS_WEIGHT, NEW_ADDRESS_WEIGHT, f"<= {CONFIRMED_DISTANCE_M}m", "Distance<=30m and New Address similarity>=60 even without name match"],
+                "Metric": ["Generated", "Base File", "Compared Files", "Total Input Stores", "Confirmed Pair Rows", "Possible Pair Rows", "Unique Stores", "Matched Stores (counted once)", "Coverage Check (matched+unique==input)", "Matched Stores in Any Iteration", "Name Weight", "Location Weight", "Address Weight", "New Address Weight", "Confirmed Distance Gate", "Possible Extra Rule", "Per-File Split Sanity"],
+                "Value": [datetime.now().isoformat(timespec="seconds"), base_file, ", ".join(compare_files), total_input_stores, len(confirmed_pair_rows), len(possible_pair_rows), len(unique_rows), matched_store_count, coverage_status, len(all_iteration_matched_ids), NAME_WEIGHT, LOCATION_WEIGHT, ADDRESS_WEIGHT, NEW_ADDRESS_WEIGHT, f"<= {CONFIRMED_DISTANCE_M}m", "Distance<=30m and New Address similarity>=60 even without name match", "PASS" if all((confirmed_by_file[f] + possible_by_file[f] + unique_by_file[f]) == total_by_file[f] for f in report_files) else "FAIL"],
             }
         ).to_excel(writer, index=False, sheet_name="Summary", startrow=len(dashboard_rows) + 3)
 
