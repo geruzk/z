@@ -538,6 +538,19 @@ def apply_excel_colors(path: str) -> None:
     for ws in wb.worksheets:
         if ws.max_row == 0:
             continue
+
+        if ws.title == "Summary":
+            # Dashboard header row
+            for cell in ws[1]:
+                cell.fill = header_fill
+                cell.font = header_font
+            # Dashboard first column labels and body highlight (requested matrix look)
+            summary_accent = PatternFill("solid", fgColor="8EC3D3")
+            for r in range(2, 8):
+                for c in range(1, ws.max_column + 1):
+                    ws.cell(r, c).fill = summary_accent
+            continue
+
         for cell in ws[1]:
             cell.fill = header_fill
             cell.font = header_font
@@ -876,12 +889,71 @@ def main() -> None:
     out_path = os.environ.get("MATCH_OUTPUT_PATH", default_out)
     out_path = str(Path(out_path).expanduser().resolve())
 
+    # Build dashboard table (requested format) for non-base files vs totals
+    base_file = "File A" if "File A" in file_names else file_names[0]
+    compare_files = [f for f in file_names if f != base_file]
+
+    unique_by_file: Dict[str, int] = {f: 0 for f in compare_files}
+    for r in unique_rows:
+        sf = str(r.get("Source_File", ""))
+        if sf in unique_by_file:
+            unique_by_file[sf] += 1
+
+    confirmed_by_file: Dict[str, int] = {f: 0 for f in compare_files}
+    for f in compare_files:
+        confirmed_by_file[f] = sum(1 for ff, _ in confirmed_store_ids if ff == f)
+
+    possible_by_file: Dict[str, int] = {f: 0 for f in compare_files}
+    for f in compare_files:
+        possible_by_file[f] = sum(1 for ff, _ in possible_store_ids if ff == f)
+
+    total_by_file: Dict[str, int] = {f: int(len(files_data[f])) for f in compare_files}
+
+    def pct(n: int, d: int) -> str:
+        return f"{round((n / d) * 100):.0f}%" if d else "0%"
+
+    dashboard_rows = [
+        "Confirmed",
+        "Possible",
+        "Unique",
+        "Total",
+        "Confirmed %",
+        "Confirmed & possible %",
+    ]
+    dashboard_data: Dict[str, List[object]] = {}
+    for f in compare_files:
+        c = confirmed_by_file.get(f, 0)
+        p = possible_by_file.get(f, 0)
+        u = unique_by_file.get(f, 0)
+        t = total_by_file.get(f, 0)
+        dashboard_data[f] = [c, p, u, t, pct(c, t), pct(c + p, t)]
+
+    # Total column
+    c_tot = sum(confirmed_by_file.values())
+    p_tot = sum(possible_by_file.values())
+    u_tot = sum(unique_by_file.values())
+    t_tot = sum(total_by_file.values())
+    dashboard_data["Total"] = [
+        c_tot,
+        p_tot,
+        u_tot,
+        t_tot,
+        pct(c_tot, t_tot),
+        pct(c_tot + p_tot, t_tot),
+    ]
+
+    dashboard_df = pd.DataFrame(dashboard_data, index=dashboard_rows).reset_index().rename(columns={"index": "Metric"})
+
     with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
+        dashboard_df.to_excel(writer, index=False, sheet_name="Summary", startrow=0)
+
+        # Keep detailed run metadata below dashboard table
         pd.DataFrame(
             {
                 "Metric": [
                     "Generated",
-                    "Files",
+                    "Base File",
+                    "Compared Files",
                     "Total Input Stores",
                     "Confirmed Pair Rows",
                     "Possible Pair Rows",
@@ -897,7 +969,8 @@ def main() -> None:
                 ],
                 "Value": [
                     datetime.now().isoformat(timespec="seconds"),
-                    ", ".join(file_names),
+                    base_file,
+                    ", ".join(compare_files),
                     total_input_stores,
                     len(confirmed_pair_rows),
                     len(possible_pair_rows),
@@ -912,7 +985,7 @@ def main() -> None:
                     "Distance<=30m and New Address similarity>=60 even without name match",
                 ],
             }
-        ).to_excel(writer, index=False, sheet_name="Summary")
+        ).to_excel(writer, index=False, sheet_name="Summary", startrow=len(dashboard_rows) + 3)
 
         confirmed_output_rows = _present_pair_rows(confirmed_pair_rows)
         possible_output_rows = _present_pair_rows(possible_pair_rows)
