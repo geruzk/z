@@ -837,6 +837,8 @@ def _best_match_store_to_base(store_row: pd.Series, store_file: str, base_df: pd
 
     return best
 
+
+
 def main() -> None:
     files_data = read_input_files()
     if len(files_data) < 2:
@@ -845,6 +847,7 @@ def main() -> None:
     file_names = sorted(files_data.keys())
     base_file = "File A" if "File A" in file_names else file_names[0]
     compare_files = [f for f in file_names if f != base_file]
+    base_df = files_data[base_file].copy()
 
     all_store_ids: Set[Tuple[str, int]] = set()
     for fn in file_names:
@@ -852,127 +855,118 @@ def main() -> None:
             all_store_ids.add((fn, int(idx)))
     total_input_stores = len(all_store_ids)
 
-    base_df = files_data[base_file].copy()
+    # Step 1: Match among non-base files first (B<->C style)
+    bc_raw_confirmed: List[Dict[str, object]] = []
+    bc_raw_strong: List[Dict[str, object]] = []
+    bc_raw_possible: List[Dict[str, object]] = []
 
-    # 1) A-anchored matching only (A with each other file)
-    raw_confirmed: List[Dict[str, object]] = []
-    raw_strong: List[Dict[str, object]] = []
-    raw_possible: List[Dict[str, object]] = []
+    for i in range(len(compare_files)):
+        for j in range(i + 1, len(compare_files)):
+            f1, f2 = compare_files[i], compare_files[j]
+            df1, df2 = files_data[f1].copy(), files_data[f2].copy()
+            c, s2, p2, _, _ = run_phase(df1, df2, f"{f1}→{f2}")
+            bc_raw_confirmed.extend(build_output_rows(c, df1, df2, f1, f2))
+            bc_raw_strong.extend(build_output_rows(s2, df1, df2, f1, f2))
+            bc_raw_possible.extend(build_output_rows(p2, df1, df2, f1, f2))
 
-    for other in compare_files:
-        df_other = files_data[other].copy()
-        confirmed, strong, possible, _, _ = run_phase(base_df, df_other, f"{base_file}→{other}")
-        raw_confirmed.extend(build_output_rows(confirmed, base_df, df_other, base_file, other))
-        raw_strong.extend(build_output_rows(strong, base_df, df_other, base_file, other))
-        raw_possible.extend(build_output_rows(possible, base_df, df_other, base_file, other))
-
-    all_iteration_matched_ids: Set[Tuple[str, int]] = set()
-    for rr in raw_confirmed + raw_strong + raw_possible:
-        all_iteration_matched_ids.add((str(rr["A_File"]), int(rr["A_Idx"])))
-        all_iteration_matched_ids.add((str(rr["B_File"]), int(rr["B_Idx"])))
-
-    merged: Dict[Tuple[Tuple[str, int], Tuple[str, int]], Dict[str, object]] = {}
-    for key, row in dedupe_match_rows(raw_possible, priority=3).items():
-        merged[key] = row
-    for key, row in dedupe_match_rows(raw_strong, priority=2).items():
-        old = merged.get(key)
+    merged_bc: Dict[Tuple[Tuple[str, int], Tuple[str, int]], Dict[str, object]] = {}
+    for key, row in dedupe_match_rows(bc_raw_possible, priority=3).items():
+        merged_bc[key] = row
+    for key, row in dedupe_match_rows(bc_raw_strong, priority=2).items():
+        old = merged_bc.get(key)
         if old is None or row["_priority"] < old["_priority"] or (row["_priority"] == old["_priority"] and float(row.get("Weighted Score (%)", 0) or 0) > float(old.get("Weighted Score (%)", 0) or 0)):
-            merged[key] = row
-    for key, row in dedupe_match_rows(raw_confirmed, priority=1).items():
-        old = merged.get(key)
+            merged_bc[key] = row
+    for key, row in dedupe_match_rows(bc_raw_confirmed, priority=1).items():
+        old = merged_bc.get(key)
         if old is None or row["_priority"] < old["_priority"] or (row["_priority"] == old["_priority"] and float(row.get("Weighted Score (%)", 0) or 0) > float(old.get("Weighted Score (%)", 0) or 0)):
-            merged[key] = row
+            merged_bc[key] = row
 
-    confirmed_pair_rows = one_to_one_global(list(merged.values()))
-    for r in confirmed_pair_rows:
+    bc_pair_rows = one_to_one_global(list(merged_bc.values()))
+    for r in bc_pair_rows:
         r.pop("_priority", None)
 
-    confirmed_store_ids: Set[Tuple[str, int]] = set()
-    for r in confirmed_pair_rows:
-        confirmed_store_ids.add((str(r["A_File"]), int(r["A_Idx"])))
-        confirmed_store_ids.add((str(r["B_File"]), int(r["B_Idx"])))
+    bc_store_ids: Set[Tuple[str, int]] = set()
+    bc_peer_map: Dict[Tuple[str, int], Tuple[str, int, object]] = {}
+    for r in bc_pair_rows:
+        a = (str(r["A_File"]), int(r["A_Idx"]))
+        b = (str(r["B_File"]), int(r["B_Idx"]))
+        bc_store_ids.update([a, b])
+        bc_peer_map[a] = (b[0], b[1], r.get("B_Customer Code", ""))
+        bc_peer_map[b] = (a[0], a[1], r.get("A_Customer Code", ""))
 
-    # 2) B<->C duplicate detection on stores still not matched to A
+    # Step 2: Match B/C results to base A
+    a_link_candidates: List[Dict[str, object]] = []
+    for sid in sorted(bc_store_ids):
+        sf, sidx = sid
+        store_row = files_data[sf].iloc[sidx]
+        rec = _best_match_store_to_base(store_row, sf, base_df, base_file)
+        if rec is None:
+            continue
+        if sid in bc_peer_map:
+            pf, pidx, pcode = bc_peer_map[sid]
+            rec["BC_Peer_File"] = pf
+            rec["BC_Peer_Idx"] = pidx
+            rec["BC_Peer_Code"] = pcode
+            rec["Reason_Code"] = "BC_TO_A_MATCH"
+        a_link_candidates.append(rec)
+
+    # Also match remaining compare-file stores directly to A
+    remaining_compare_ids = {(f, int(i)) for f in compare_files for i in files_data[f].index} - bc_store_ids
+    for sid in sorted(remaining_compare_ids):
+        sf, sidx = sid
+        rec = _best_match_store_to_base(files_data[sf].iloc[sidx], sf, base_df, base_file)
+        if rec is not None:
+            rec["Reason_Code"] = rec.get("Reason_Code", "DIRECT_TO_A")
+            a_link_candidates.append(rec)
+
+    # Final dedupe one-to-one across A and compare stores
+    final_rows = one_to_one_global(a_link_candidates)
+
+    confirmed_pair_rows: List[Dict[str, object]] = []
     possible_pair_rows: List[Dict[str, object]] = []
-    possible_store_ids: Set[Tuple[str, int]] = set()
-    bc_duplicate_pool_ids: Set[Tuple[str, int]] = set()
+    matched_store_ids: Set[Tuple[str, int]] = set()
+    all_iteration_matched_ids: Set[Tuple[str, int]] = set(bc_store_ids)
 
-    if len(compare_files) >= 2:
-        f1, f2 = compare_files[0], compare_files[1]
-        df1 = files_data[f1].copy()
-        df2 = files_data[f2].copy()
+    for r in final_rows:
+        a = (str(r["A_File"]), int(r["A_Idx"]))
+        b = (str(r["B_File"]), int(r["B_Idx"]))
+        matched_store_ids.update([a, b])
+        all_iteration_matched_ids.update([a, b])
+        conf = str(r.get("Confidence", ""))
+        if conf.startswith("✓"):
+            confirmed_pair_rows.append(r)
+        else:
+            possible_pair_rows.append(r)
 
-        # keep only unmatched-to-A stores for duplicate check
-        idx1 = [i for i in df1.index if (f1, int(i)) not in confirmed_store_ids]
-        idx2 = [i for i in df2.index if (f2, int(i)) not in confirmed_store_ids]
-        df1u = df1.loc[idx1].reset_index(drop=True)
-        df2u = df2.loc[idx2].reset_index(drop=True)
-
-        c2, s2, p2, _, _ = run_phase(df1u, df2u, f"{f1}→{f2}")
-        bc_rows = build_output_rows(c2, df1u, df2u, f1, f2) + build_output_rows(s2, df1u, df2u, f1, f2) + build_output_rows(p2, df1u, df2u, f1, f2)
-
-        # Re-check each B/C candidate against A; if no A match, keep as possible opportunity
-        for row in bc_rows:
-            s1 = row.get("A_store_name", "")
-            s2n = row.get("B_store_name", "")
-            # track this duplicate pool
-            bc_duplicate_pool_ids.add((f1, int(row["A_Idx"])))
-            bc_duplicate_pool_ids.add((f2, int(row["B_Idx"])))
-
-            # Try map each side to A
-            rec1 = _best_match_store_to_base(df1u.iloc[int(row["A_Idx"])], f1, base_df, base_file)
-            rec2 = _best_match_store_to_base(df2u.iloc[int(row["B_Idx"])], f2, base_df, base_file)
-            chosen = None
-            if rec1 and rec2:
-                chosen = rec1 if float(rec1.get("Weighted Score (%)", 0) or 0) >= float(rec2.get("Weighted Score (%)", 0) or 0) else rec2
-            else:
-                chosen = rec1 or rec2
-
-            if chosen is not None:
-                # promote to confirmed because it found A match through B/C duplicate route
-                chosen["Reason_Code"] = "BC_DUPLICATE_MAPPED_TO_A"
-                if chosen not in confirmed_pair_rows:
-                    confirmed_pair_rows.append(chosen)
-                    confirmed_store_ids.add((str(chosen["A_File"]), int(chosen["A_Idx"])))
-                    confirmed_store_ids.add((str(chosen["B_File"]), int(chosen["B_Idx"])))
-            else:
-                # no A match, keep as possible opportunity row
-                row["Reason_Code"] = "BC_DUPLICATE_NOT_IN_A"
-                row["Confidence"] = "⚠ Possible (B-C duplicate not found in A)"
-                possible_pair_rows.append(row)
-                possible_store_ids.add((f1, int(row["A_Idx"])))
-                possible_store_ids.add((f2, int(row["B_Idx"])))
-
-    # 3) Fallback possible from unmatched stores (distance<=30 & new address)
-    unmatched_after_confirmed = all_store_ids - confirmed_store_ids
-    fallback_pairs = build_possible_pairs_from_unmatched(files_data, unmatched_after_confirmed, new_addr_threshold=60.0)
+    # Unique after all iterations (BC + A-link + fallback)
+    unmatched_after_final = all_store_ids - matched_store_ids
+    fallback_pairs = build_possible_pairs_from_unmatched(files_data, unmatched_after_final, new_addr_threshold=60.0)
     for a_id, b_id, naddr_score, dist_m in fallback_pairs:
-        file_a, idx_a = a_id
-        file_b, idx_b = b_id
-        if file_a == base_file and file_b in compare_files:
-            row_a = files_data[file_a].iloc[idx_a]
-            row_b = files_data[file_b].iloc[idx_b]
-        elif file_b == base_file and file_a in compare_files:
-            # normalize A on left
-            row_a = files_data[file_b].iloc[idx_b]
-            row_b = files_data[file_a].iloc[idx_a]
-            file_a, idx_a, file_b, idx_b = file_b, idx_b, file_a, idx_a
+        # keep A-anchored fallback only
+        if a_id[0] == base_file:
+            a_file, a_idx = a_id
+            b_file, b_idx = b_id
+        elif b_id[0] == base_file:
+            a_file, a_idx = b_id
+            b_file, b_idx = a_id
         else:
             continue
 
+        row_a = files_data[a_file].iloc[a_idx]
+        row_b = files_data[b_file].iloc[b_idx]
         name_score, generic_only, shared_generic, shared_distinctive = name_similarity(row_a.get("store_name", ""), row_b.get("store_name", ""))
         addr_score = address_similarity(row_a.get("store_address", ""), row_b.get("store_address", ""))
         new_addr_score = address_similarity(row_a.get("Address_English", ""), row_b.get("Address_English", ""))
         loc_score = location_score(dist_m)
         w_score = weighted_score(name_score, loc_score, addr_score, new_addr_score)
         rec = {
-            "A_File": file_a,
-            "A_Idx": int(idx_a),
-            "B_File": file_b,
-            "B_Idx": int(idx_b),
+            "A_File": a_file,
+            "A_Idx": int(a_idx),
+            "B_File": b_file,
+            "B_Idx": int(b_idx),
             **{f"A_{c}": row_a[c] for c in row_a.index},
             **{f"B_{c}": row_b[c] for c in row_b.index},
-            "Comparison": f"{file_a} ↔ {file_b}",
+            "Comparison": f"{a_file} ↔ {b_file}",
             "Name Score (%)": round(name_score, 2),
             "Address Score (%)": addr_score,
             "New Address Score (%)": round(new_addr_score, 2) if new_addr_score is not None else None,
@@ -986,13 +980,8 @@ def main() -> None:
             "Generic_Only_Overlap": "Yes" if generic_only else "No",
         }
         possible_pair_rows.append(rec)
-        possible_store_ids.add((file_a, int(idx_a)))
-        possible_store_ids.add((file_b, int(idx_b)))
-
-    # Unique from all iterations and pools
-    all_iteration_matched_ids.update(confirmed_store_ids)
-    all_iteration_matched_ids.update(possible_store_ids)
-    all_iteration_matched_ids.update(bc_duplicate_pool_ids)
+        matched_store_ids.update([(a_file, int(a_idx)), (b_file, int(b_idx))])
+        all_iteration_matched_ids.update([(a_file, int(a_idx)), (b_file, int(b_idx))])
 
     unique_store_ids = all_store_ids - all_iteration_matched_ids
     unique_rows: List[Dict[str, object]] = []
@@ -1009,33 +998,23 @@ def main() -> None:
     out_path = os.environ.get("MATCH_OUTPUT_PATH", default_out)
     out_path = str(Path(out_path).expanduser().resolve())
 
-    # Dashboard table for compared files
-    unique_by_file: Dict[str, int] = {f: 0 for f in compare_files}
-    for r in unique_rows:
-        sf = str(r.get("Source_File", ""))
-        if sf in unique_by_file:
-            unique_by_file[sf] += 1
+    # Dashboard table (base + compared files + total)
+    report_files = [base_file] + compare_files
+    confirmed_ids = set((str(r["A_File"]), int(r["A_Idx"])) for r in confirmed_pair_rows) | set((str(r["B_File"]), int(r["B_Idx"])) for r in confirmed_pair_rows)
+    possible_ids = set((str(r["A_File"]), int(r["A_Idx"])) for r in possible_pair_rows) | set((str(r["B_File"]), int(r["B_Idx"])) for r in possible_pair_rows)
 
-    confirmed_by_file: Dict[str, int] = {f: 0 for f in compare_files}
-    for f in compare_files:
-        confirmed_by_file[f] = sum(1 for ff, _ in confirmed_store_ids if ff == f)
-
-    possible_by_file: Dict[str, int] = {f: 0 for f in compare_files}
-    for f in compare_files:
-        possible_by_file[f] = sum(1 for ff, _ in possible_store_ids if ff == f)
-
-    total_by_file: Dict[str, int] = {f: int(len(files_data[f])) for f in compare_files}
+    unique_by_file = {f: sum(1 for r in unique_rows if str(r.get("Source_File", "")) == f) for f in report_files}
+    confirmed_by_file = {f: sum(1 for ff, _ in confirmed_ids if ff == f) for f in report_files}
+    possible_by_file = {f: sum(1 for ff, _ in possible_ids if ff == f) for f in report_files}
+    total_by_file = {f: int(len(files_data[f])) for f in report_files}
 
     def pct(n: int, d: int) -> str:
         return f"{round((n / d) * 100):.0f}%" if d else "0%"
 
     dashboard_rows = ["Confirmed", "Possible", "Unique", "Total", "Confirmed %", "Confirmed & possible %"]
-    dashboard_data: Dict[str, List[object]] = {}
-    for f in compare_files:
-        c = confirmed_by_file.get(f, 0)
-        p = possible_by_file.get(f, 0)
-        u = unique_by_file.get(f, 0)
-        t = total_by_file.get(f, 0)
+    dashboard_data = {}
+    for f in report_files:
+        c, p, u, t = confirmed_by_file[f], possible_by_file[f], unique_by_file[f], total_by_file[f]
         dashboard_data[f] = [c, p, u, t, pct(c, t), pct(c + p, t)]
 
     c_tot = sum(confirmed_by_file.values())
@@ -1046,6 +1025,16 @@ def main() -> None:
 
     dashboard_df = pd.DataFrame(dashboard_data, index=dashboard_rows).reset_index().rename(columns={"index": "Metric"})
 
+    def add_mapping_codes(rows: List[Dict[str, object]]) -> List[Dict[str, object]]:
+        out = []
+        for r in _present_pair_rows(rows):
+            rr = dict(r)
+            rr["Map_Code_File_A"] = rr.get("Store_1_Customer Code") if rr.get("Store_1_File") == "File A" else rr.get("Store_2_Customer Code") if rr.get("Store_2_File") == "File A" else ""
+            rr["Map_Code_File_B"] = rr.get("Store_1_Customer Code") if rr.get("Store_1_File") == "File B" else rr.get("Store_2_Customer Code") if rr.get("Store_2_File") == "File B" else rr.get("BC_Peer_Code", "") if rr.get("BC_Peer_File") == "File B" else ""
+            rr["Map_Code_File_C"] = rr.get("Store_1_Customer Code") if rr.get("Store_1_File") == "File C" else rr.get("Store_2_Customer Code") if rr.get("Store_2_File") == "File C" else rr.get("BC_Peer_Code", "") if rr.get("BC_Peer_File") == "File C" else ""
+            out.append(rr)
+        return out
+
     with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
         dashboard_df.to_excel(writer, index=False, sheet_name="Summary", startrow=0)
         pd.DataFrame(
@@ -1055,25 +1044,8 @@ def main() -> None:
             }
         ).to_excel(writer, index=False, sheet_name="Summary", startrow=len(dashboard_rows) + 3)
 
-        confirmed_output_rows = _present_pair_rows(confirmed_pair_rows)
-        possible_output_rows = _present_pair_rows(possible_pair_rows)
-
-        # Add mapping code columns for A/B/C visibility
-        def add_mapping_codes(rows: List[Dict[str, object]]) -> List[Dict[str, object]]:
-            out = []
-            for r in rows:
-                rr = dict(r)
-                rr["Map_Code_File_A"] = rr.get("Store_1_Customer Code") if rr.get("Store_1_File") == "File A" else rr.get("Store_2_Customer Code") if rr.get("Store_2_File") == "File A" else ""
-                rr["Map_Code_File_B"] = rr.get("Store_1_Customer Code") if rr.get("Store_1_File") == "File B" else rr.get("Store_2_Customer Code") if rr.get("Store_2_File") == "File B" else ""
-                rr["Map_Code_File_C"] = rr.get("Store_1_Customer Code") if rr.get("Store_1_File") == "File C" else rr.get("Store_2_Customer Code") if rr.get("Store_2_File") == "File C" else ""
-                out.append(rr)
-            return out
-
-        confirmed_output_rows = add_mapping_codes(confirmed_output_rows)
-        possible_output_rows = add_mapping_codes(possible_output_rows)
-
-        pd.DataFrame(confirmed_output_rows).to_excel(writer, index=False, sheet_name="Confirmed_Matches")
-        pd.DataFrame(possible_output_rows).to_excel(writer, index=False, sheet_name="Possible_Matches")
+        pd.DataFrame(add_mapping_codes(confirmed_pair_rows)).to_excel(writer, index=False, sheet_name="Confirmed_Matches")
+        pd.DataFrame(add_mapping_codes(possible_pair_rows)).to_excel(writer, index=False, sheet_name="Possible_Matches")
         pd.DataFrame(unique_rows).to_excel(writer, index=False, sheet_name="Unique_Stores")
 
     apply_excel_colors(out_path)
