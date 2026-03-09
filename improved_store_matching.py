@@ -650,11 +650,11 @@ def main() -> None:
 
     file_names = sorted(files_data.keys())
 
-    # count input stores once (store-level accounting)
-    all_store_ids: List[Tuple[str, int]] = []
+    # Input store universe (for coverage/integrity checks)
+    all_store_ids: Set[Tuple[str, int]] = set()
     for fn in file_names:
         for idx in files_data[fn].index:
-            all_store_ids.append((fn, int(idx)))
+            all_store_ids.add((fn, int(idx)))
     total_input_stores = len(all_store_ids)
 
     raw_confirmed: List[Dict[str, object]] = []
@@ -686,46 +686,76 @@ def main() -> None:
         if old is None or row["_priority"] < old["_priority"] or (row["_priority"] == old["_priority"] and float(row.get("Weighted Score (%)", 0) or 0) > float(old.get("Weighted Score (%)", 0) or 0)):
             merged[key] = row
 
-    final_pairs = one_to_one_global(list(merged.values()))
-    for r in final_pairs:
+    confirmed_rows = one_to_one_global(list(merged.values()))
+    for r in confirmed_rows:
         r.pop("_priority", None)
 
-    # Tab 1: Confirmed_Matches = all matches from confirmed/strong/possible tiers (store-level rows)
-    confirmed_rows: List[Dict[str, object]] = []
-    confirmed_stores: Set[Tuple[str, int]] = set()
-    for r in final_pairs:
-        a_id = (str(r["A_File"]), int(r["A_Idx"]))
-        b_id = (str(r["B_File"]), int(r["B_Idx"]))
-        confirmed_stores.add(a_id)
-        confirmed_stores.add(b_id)
+    confirmed_store_ids: Set[Tuple[str, int]] = set()
+    for r in confirmed_rows:
+        confirmed_store_ids.add((str(r["A_File"]), int(r["A_Idx"])))
+        confirmed_store_ids.add((str(r["B_File"]), int(r["B_Idx"])))
 
-        reason = str(r.get("Reason_Code", "")) or "MATCHED_BY_MAIN_RULES"
-        confirmed_rows.append(store_output_row(a_id, files_data, "✓ Matched", True, b_id, reason))
-        confirmed_rows.append(store_output_row(b_id, files_data, "✓ Matched", True, a_id, reason))
-
-    # Tab 2: Possible_Matches = unmatched stores with distance<=30m + New Address similarity condition, no name condition
-    unmatched_after_confirmed = set(all_store_ids) - confirmed_stores
+    # Possible fallback (even when name does not match): distance <=30m + new address similarity
+    unmatched_after_confirmed = all_store_ids - confirmed_store_ids
     possible_pairs = build_possible_pairs_from_unmatched(files_data, unmatched_after_confirmed, new_addr_threshold=60.0)
 
     possible_rows: List[Dict[str, object]] = []
-    possible_stores: Set[Tuple[str, int]] = set()
+    possible_store_ids: Set[Tuple[str, int]] = set()
     for a_id, b_id, naddr_score, dist_m in possible_pairs:
-        possible_stores.add(a_id)
-        possible_stores.add(b_id)
-        reason = f"DIST<=30M_AND_NEWADDR>={naddr_score:.2f}_DIST={dist_m:.2f}"
-        possible_rows.append(store_output_row(a_id, files_data, "⚠ Possible", True, b_id, reason))
-        possible_rows.append(store_output_row(b_id, files_data, "⚠ Possible", True, a_id, reason))
+        file_a, idx_a = a_id
+        file_b, idx_b = b_id
+        row_a = files_data[file_a].iloc[idx_a]
+        row_b = files_data[file_b].iloc[idx_b]
 
-    # Tab 3: Unique = remaining stores only once
-    unique_store_ids = set(all_store_ids) - confirmed_stores - possible_stores
-    unique_rows: List[Dict[str, object]] = [
-        store_output_row(sid, files_data, "✗ Unique", False, None, "NO_RULE_MATCH")
-        for sid in sorted(unique_store_ids)
-    ]
+        name_score, generic_only, shared_generic, shared_distinctive = name_similarity(
+            row_a.get("store_name", ""), row_b.get("store_name", "")
+        )
+        addr_score = address_similarity(row_a.get("store_address", ""), row_b.get("store_address", ""))
+        new_addr_score = address_similarity(row_a.get("Address_English", ""), row_b.get("Address_English", ""))
+        loc_score = location_score(dist_m)
+        w_score = weighted_score(name_score, loc_score, addr_score, new_addr_score)
 
-    # strict store-level integrity: counts across 3 tabs must equal total input stores
-    total_split_rows = len(confirmed_rows) + len(possible_rows) + len(unique_rows)
-    integrity_status = "PASS" if total_split_rows == total_input_stores else "FAIL"
+        rec: Dict[str, object] = {
+            "A_File": file_a,
+            "A_Idx": int(idx_a),
+            "B_File": file_b,
+            "B_Idx": int(idx_b),
+        }
+        rec.update({f"A_{col}": row_a[col] for col in row_a.index})
+        rec.update({f"B_{col}": row_b[col] for col in row_b.index})
+        rec.update(
+            {
+                "Comparison": f"{file_a} ↔ {file_b}",
+                "Name Score (%)": round(name_score, 2),
+                "Address Score (%)": addr_score,
+                "New Address Score (%)": round(naddr_score, 2) if new_addr_score is not None else None,
+                "Location Score (%)": round(loc_score, 2),
+                "Distance (m)": round(dist_m, 2),
+                "Weighted Score (%)": round(w_score, 2),
+                "Shared_Generic_Tokens": shared_generic,
+                "Shared_Distinctive_Tokens": shared_distinctive,
+                "Reason_Code": "POSSIBLE_DIST<=30_AND_NEWADDR",
+                "Confidence": "⚠ Possible",
+                "Generic_Only_Overlap": "Yes" if generic_only else "No",
+            }
+        )
+        possible_rows.append(rec)
+        possible_store_ids.add(a_id)
+        possible_store_ids.add(b_id)
+
+    # Unique stores (once only)
+    unique_store_ids = all_store_ids - confirmed_store_ids - possible_store_ids
+    unique_rows: List[Dict[str, object]] = []
+    for file_name, idx in sorted(unique_store_ids):
+        row = files_data[file_name].iloc[idx]
+        rec = {col: row[col] for col in row.index}
+        rec["Source_File"] = file_name
+        rec["Source_Idx"] = int(idx)
+        rec["Status"] = "✗ Unique"
+        unique_rows.append(rec)
+
+    matched_store_count = len(confirmed_store_ids | possible_store_ids)
+    coverage_status = "PASS" if (matched_store_count + len(unique_rows) == total_input_stores) else "FAIL"
 
     default_out = "/content/improved_bidirectional_matching.xlsx" if os.path.isdir("/content") else "improved_bidirectional_matching.xlsx"
     out_path = os.environ.get("MATCH_OUTPUT_PATH", default_out)
@@ -738,11 +768,11 @@ def main() -> None:
                     "Generated",
                     "Files",
                     "Total Input Stores",
-                    "Confirmed Tab Rows (store-level)",
-                    "Possible Tab Rows (store-level)",
-                    "Unique Tab Rows",
-                    "Total Split Rows (3 tabs)",
-                    "Integrity Check (split rows == input)",
+                    "Confirmed Pairs",
+                    "Possible Pairs",
+                    "Unique Stores",
+                    "Matched Stores (counted once)",
+                    "Coverage Check (matched+unique==input)",
                     "Name Weight",
                     "Location Weight",
                     "Address Weight",
@@ -757,8 +787,8 @@ def main() -> None:
                     len(confirmed_rows),
                     len(possible_rows),
                     len(unique_rows),
-                    total_split_rows,
-                    integrity_status,
+                    matched_store_count,
+                    coverage_status,
                     NAME_WEIGHT,
                     LOCATION_WEIGHT,
                     ADDRESS_WEIGHT,
@@ -776,7 +806,9 @@ def main() -> None:
     apply_excel_colors(out_path)
 
     print(f"Saved: {out_path}")
-    print(f"Integrity: {integrity_status} | Input={total_input_stores}, SplitRows={total_split_rows}")
+    print(
+        f"Coverage: {coverage_status} | Input={total_input_stores}, MatchedStores={matched_store_count}, Unique={len(unique_rows)}"
+    )
 
     # Auto-download when running in Colab so users can access the file immediately.
     try:
