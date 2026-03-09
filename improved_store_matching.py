@@ -770,18 +770,17 @@ def _present_pair_rows(pair_rows: List[Dict[str, object]]) -> List[Dict[str, obj
 
 
 
-def _best_match_store_to_base(store_row: pd.Series, store_file: str, base_df: pd.DataFrame, base_file: str) -> Optional[Dict[str, object]]:
+def _best_match_store_to_base(store_row: pd.Series, store_file: str, base_df: pd.DataFrame, base_file: str, base_tree: Optional[BallTree], base_idx_map: List[int], cols_b: Dict[str, Optional[str]], cols_s: Optional[Dict[str, Optional[str]]] = None) -> Optional[Dict[str, object]]:
     """Find best A-anchored match for one store row using existing scoring rules."""
-    cols_s = resolve_columns(pd.DataFrame([store_row]))
-    cols_b = resolve_columns(base_df)
+    if cols_s is None:
+        cols_s = resolve_columns(pd.DataFrame([store_row]))
 
     lat_s = safe_float(store_row.get(cols_s.get("lat") or ""))
     lng_s = safe_float(store_row.get(cols_s.get("lng") or ""))
     if not is_valid_coordinate(lat_s, lng_s):
         return None
 
-    tree, idx_map = build_balltree(base_df, cols_b.get("lat") or "", cols_b.get("lng") or "")
-    cands = nearby_candidates(tree, idx_map, lat_s, lng_s)
+    cands = nearby_candidates(base_tree, base_idx_map, lat_s, lng_s)
     if not cands:
         return None
 
@@ -899,7 +898,7 @@ def main() -> None:
     for sid in sorted(bc_store_ids):
         sf, sidx = sid
         store_row = files_data[sf].iloc[sidx]
-        rec = _best_match_store_to_base(store_row, sf, base_df, base_file)
+        rec = _best_match_store_to_base(store_row, sf, base_df, base_file, base_tree, base_idx_map, cols_base, cols_by_file.get(sf))
         if rec is None:
             continue
         if sid in bc_peer_map:
@@ -914,7 +913,7 @@ def main() -> None:
     remaining_compare_ids = {(f, int(i)) for f in compare_files for i in files_data[f].index} - bc_store_ids
     for sid in sorted(remaining_compare_ids):
         sf, sidx = sid
-        rec = _best_match_store_to_base(files_data[sf].iloc[sidx], sf, base_df, base_file)
+        rec = _best_match_store_to_base(files_data[sf].iloc[sidx], sf, base_df, base_file, base_tree, base_idx_map, cols_base, cols_by_file.get(sf))
         if rec is not None:
             rec["Reason_Code"] = rec.get("Reason_Code", "DIRECT_TO_A")
             a_link_candidates.append(rec)
