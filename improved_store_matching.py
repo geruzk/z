@@ -19,7 +19,7 @@ from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 import pandas as pd
-from rapidfuzz import fuzz
+from difflib import SequenceMatcher
 from sklearn.neighbors import BallTree
 
 
@@ -54,6 +54,57 @@ GENERIC_RETAIL_TOKENS: Set[str] = {
 ARABIC_DIACRITIC_RE = re.compile("[\u064B-\u065F\u0670\u06D6-\u06DC\u06DF-\u06E4\u06E7-\u06E8\u06EA-\u06ED]")
 TATWEEL_RE = re.compile("\u0640")
 PUNCT_RE = re.compile(r"[^0-9a-zء-ي\s]")
+
+
+def _ratio(a: str, b: str) -> float:
+    if not a and not b:
+        return 100.0
+    if not a or not b:
+        return 0.0
+    return SequenceMatcher(None, a, b).ratio() * 100.0
+
+
+def _token_set_ratio(a: str, b: str) -> float:
+    a_tokens = set(a.split()) if a else set()
+    b_tokens = set(b.split()) if b else set()
+    if not a_tokens and not b_tokens:
+        return 100.0
+    if not a_tokens or not b_tokens:
+        return 0.0
+    inter = a_tokens & b_tokens
+    a_only = a_tokens - inter
+    b_only = b_tokens - inter
+
+    def join_tokens(tokens):
+        return " ".join(sorted(tokens)).strip()
+
+    s_inter = join_tokens(inter)
+    s_a = join_tokens(inter | a_only)
+    s_b = join_tokens(inter | b_only)
+
+    # Similar spirit to token-set behavior
+    return max(_ratio(s_inter, s_a), _ratio(s_inter, s_b), _ratio(s_a, s_b))
+
+
+def _partial_ratio(a: str, b: str) -> float:
+    if not a and not b:
+        return 100.0
+    if not a or not b:
+        return 0.0
+
+    # Slide the shorter string over the longer one and pick best local ratio
+    short, long_ = (a, b) if len(a) <= len(b) else (b, a)
+    window = len(short)
+    if window == 0:
+        return 0.0
+
+    best = 0.0
+    for i in range(0, len(long_) - window + 1):
+        cand = long_[i : i + window]
+        best = max(best, _ratio(short, cand))
+        if best >= 100.0:
+            break
+    return best
 
 
 @dataclass
@@ -184,15 +235,15 @@ def name_similarity(a_name: str, b_name: str) -> Tuple[float, bool, str, str]:
     b_text = " ".join(b_dist) if b_dist else ""
 
     if a_text and b_text:
-        token_set = fuzz.token_set_ratio(a_text, b_text)
-        ratio = fuzz.ratio(a_text, b_text)
-        partial = fuzz.partial_ratio(a_text, b_text)
+        token_set = _token_set_ratio(a_text, b_text)
+        ratio = _ratio(a_text, b_text)
+        partial = _partial_ratio(a_text, b_text)
         score = 0.5 * token_set + 0.3 * ratio + 0.2 * partial
     else:
         # If no distinctive tokens, fall back to full name with penalty.
-        token_set = fuzz.token_set_ratio(normalize_text(a_name), normalize_text(b_name))
-        ratio = fuzz.ratio(normalize_text(a_name), normalize_text(b_name))
-        partial = fuzz.partial_ratio(normalize_text(a_name), normalize_text(b_name))
+        token_set = _token_set_ratio(normalize_text(a_name), normalize_text(b_name))
+        ratio = _ratio(normalize_text(a_name), normalize_text(b_name))
+        partial = _partial_ratio(normalize_text(a_name), normalize_text(b_name))
         score = (0.5 * token_set + 0.3 * ratio + 0.2 * partial) * 0.4
 
     if generic_only_overlap:
@@ -215,7 +266,7 @@ def address_similarity(a_addr: str, b_addr: str) -> Optional[float]:
     if _is_error_message(a_addr) or _is_error_message(b_addr):
         return 0.0
 
-    return round(float(fuzz.token_set_ratio(a_dist, b_dist)), 2)
+    return round(float(_token_set_ratio(a_dist, b_dist)), 2)
 
 
 def weighted_score(name: float, loc: float, addr: Optional[float], new_addr: Optional[float]) -> float:
